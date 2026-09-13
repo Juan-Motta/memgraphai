@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"memgraphai/internal/domain"
+	"memgraphai/internal/telemetry"
 )
 
 // Store owns narrow Phase 0 identity and publication experiments.
@@ -34,105 +36,31 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 }
 
 func (s *Store) initialize(ctx context.Context) error {
-	for _, statement := range []string{
-		"PRAGMA foreign_keys = ON",
-		`CREATE TABLE IF NOT EXISTS projects (
-			project_id TEXT PRIMARY KEY NOT NULL,
-			display_name TEXT NOT NULL
-		)`,
-		`CREATE TRIGGER IF NOT EXISTS projects_id_immutable
-			BEFORE UPDATE OF project_id ON projects
-			BEGIN SELECT RAISE(ABORT, 'project_id_immutable'); END`,
-		`CREATE TABLE IF NOT EXISTS project_paths (
-			project_id TEXT NOT NULL REFERENCES projects(project_id),
-			supplied_path TEXT NOT NULL,
-			resolved_path TEXT NOT NULL,
-			PRIMARY KEY (project_id, supplied_path)
-		)`,
-		`CREATE TABLE IF NOT EXISTS workstreams (
-			workstream_id TEXT PRIMARY KEY NOT NULL,
-			project_id TEXT NOT NULL REFERENCES projects(project_id),
-			UNIQUE (workstream_id, project_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS sessions (
-			session_id TEXT PRIMARY KEY NOT NULL,
-			project_id TEXT NOT NULL,
-			workstream_id TEXT NOT NULL,
-			FOREIGN KEY (workstream_id, project_id)
-				REFERENCES workstreams(workstream_id, project_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS documents (
-			document_id TEXT PRIMARY KEY NOT NULL,
-			project_id TEXT NOT NULL REFERENCES projects(project_id),
-			current_revision_id TEXT
-		)`,
-		`CREATE TABLE IF NOT EXISTS revisions (
-			revision_id TEXT PRIMARY KEY NOT NULL,
-			document_id TEXT NOT NULL REFERENCES documents(document_id),
-			predecessor_revision_id TEXT,
-			file_path TEXT NOT NULL,
-			checksum TEXT NOT NULL,
-			byte_count INTEGER NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS operations (
-			operation_id TEXT PRIMARY KEY NOT NULL,
-			fingerprint TEXT NOT NULL,
-			request_fingerprint TEXT NOT NULL,
-			project_id TEXT NOT NULL REFERENCES projects(project_id),
-			document_id TEXT NOT NULL REFERENCES documents(document_id),
-			revision_id TEXT NOT NULL,
-			expected_current_revision_id TEXT,
-			owner_generation INTEGER NOT NULL DEFAULT 0,
-			state TEXT NOT NULL,
-			result_outcome TEXT,
-			result_revision_id TEXT
-		)`,
-	} {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("initialize identity schema: %w", err)
-		}
-	}
-	if err := s.ensureOperationColumns(ctx); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) ensureOperationColumns(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(operations)")
-	if err != nil {
-		return fmt.Errorf("inspect operation schema: %w", err)
-	}
-	defer rows.Close()
-	columns := map[string]bool{}
-	for rows.Next() {
-		var index int
-		var name, typ string
-		var notNull, primaryKey int
-		var defaultValue any
-		if err := rows.Scan(&index, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
-			return fmt.Errorf("inspect operation column: %w", err)
-		}
-		columns[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("inspect operation schema rows: %w", err)
-	}
-	for name, statement := range map[string]string{
-		"request_fingerprint": "ALTER TABLE operations ADD COLUMN request_fingerprint TEXT",
-		"project_id":          "ALTER TABLE operations ADD COLUMN project_id TEXT",
-	} {
-		if !columns[name] {
-			if _, err := s.db.ExecContext(ctx, statement); err != nil {
-				return fmt.Errorf("add operation %s: %w", name, err)
-			}
-		}
-	}
-	return nil
+	return applyMigrations(ctx, s.db)
 }
 
 // Close releases the underlying test database.
 func (s *Store) Close() error { return s.db.Close() }
+
+// Record persists a bounded Phase 1 metric without consulting it for business behavior.
+func (s *Store) Record(ctx context.Context, operation telemetry.Operation) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO operation_metrics(
+		operation_id, recorded_at, interface, scope_kind, project_id, workstream_id,
+		session_id, outcome, backend_duration_ns, response_bytes, result_count
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		operation.OperationID, operation.RecordedAt.UTC().Format(time.RFC3339Nano), operation.Interface,
+		operation.ScopeKind, nullableValue(operation.ProjectID), nullableValue(operation.WorkstreamID),
+		nullableValue(operation.SessionID), operation.Outcome, operation.BackendDuration.Nanoseconds(),
+		operation.ResponseBytes, nullableCount(operation.ResultCount))
+	return err
+}
+
+func nullableCount(value *int) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
 
 func (s *Store) CreateProject(ctx context.Context, id, name string) error {
 	_, err := s.db.ExecContext(ctx, "INSERT INTO projects(project_id, display_name) VALUES (?, ?)", id, name)
