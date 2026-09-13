@@ -13,9 +13,10 @@ import (
 
 // Store owns narrow Phase 0 identity and publication experiments.
 type Store struct {
-	db           *sql.DB
-	beforeCommit func() error
-	afterCommit  func() error
+	db                   *sql.DB
+	beforeCommit         func() error
+	afterCommit          func() error
+	afterOperationCommit func() error
 }
 
 // Open creates the Phase 0 identity schema in an isolated SQLite database.
@@ -73,9 +74,58 @@ func (s *Store) initialize(ctx context.Context) error {
 			checksum TEXT NOT NULL,
 			byte_count INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS operations (
+			operation_id TEXT PRIMARY KEY NOT NULL,
+			fingerprint TEXT NOT NULL,
+			request_fingerprint TEXT NOT NULL,
+			project_id TEXT NOT NULL REFERENCES projects(project_id),
+			document_id TEXT NOT NULL REFERENCES documents(document_id),
+			revision_id TEXT NOT NULL,
+			expected_current_revision_id TEXT,
+			owner_generation INTEGER NOT NULL DEFAULT 0,
+			state TEXT NOT NULL,
+			result_outcome TEXT,
+			result_revision_id TEXT
+		)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize identity schema: %w", err)
+		}
+	}
+	if err := s.ensureOperationColumns(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureOperationColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(operations)")
+	if err != nil {
+		return fmt.Errorf("inspect operation schema: %w", err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var index int
+		var name, typ string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&index, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("inspect operation column: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect operation schema rows: %w", err)
+	}
+	for name, statement := range map[string]string{
+		"request_fingerprint": "ALTER TABLE operations ADD COLUMN request_fingerprint TEXT",
+		"project_id":          "ALTER TABLE operations ADD COLUMN project_id TEXT",
+	} {
+		if !columns[name] {
+			if _, err := s.db.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("add operation %s: %w", name, err)
+			}
 		}
 	}
 	return nil
@@ -203,7 +253,7 @@ func foreignKeyDSN(dsn string) string {
 	if strings.Contains(dsn, "?") {
 		separator = "&"
 	}
-	return dsn + separator + "_pragma=foreign_keys(1)"
+	return dsn + separator + "_pragma=foreign_keys(1)&_pragma=busy_timeout(100)"
 }
 
 func (s *Store) validateWorkstreamProject(ctx context.Context, projectID, workstreamID string) error {

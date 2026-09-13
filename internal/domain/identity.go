@@ -7,15 +7,19 @@ type ProjectID string
 type Outcome string
 
 const (
-	None            Outcome = "none"
-	One             Outcome = "one"
-	Many            Outcome = "many"
-	Unavailable     Outcome = "unavailable"
-	Immutable       Outcome = "immutable"
-	BindingMismatch Outcome = "binding_mismatch"
-	ScopeDenied     Outcome = "scope_denied"
-	Conflict        Outcome = "conflict"
-	Unknown         Outcome = "unknown"
+	None                 Outcome = "none"
+	One                  Outcome = "one"
+	Many                 Outcome = "many"
+	Unavailable          Outcome = "unavailable"
+	Immutable            Outcome = "immutable"
+	BindingMismatch      Outcome = "binding_mismatch"
+	ScopeDenied          Outcome = "scope_denied"
+	Conflict             Outcome = "conflict"
+	Unknown              Outcome = "unknown"
+	IdempotencyMismatch  Outcome = "idempotency_mismatch"
+	IntegrityDiscrepancy Outcome = "integrity_discrepancy"
+	Busy                 Outcome = "busy"
+	Retryable            Outcome = "retryable"
 )
 
 // Error carries a stable outcome without exposing store details.
