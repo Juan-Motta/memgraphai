@@ -3,11 +3,14 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
 
 	"memgraphai/internal/app"
+	"memgraphai/internal/domain"
+	"memgraphai/internal/revisionfs"
 	"memgraphai/internal/telemetry"
 	"memgraphai/internal/testkit"
 )
@@ -24,8 +27,8 @@ func TestOpenRecordsFoundationMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read schema migration version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("migration version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("migration version = %d, want 4", version)
 	}
 }
 
@@ -77,8 +80,8 @@ func TestOpenMigratesValidV2ContinuityRowsWithoutInventingProvenanceOrTime(t *te
 		t.Fatalf("migrated legacy metadata = %q/%v/%q/%q/%v, want unknown provenance, open state, and NULL times", workstreamOrigin, workstreamCreated.Valid, status, sessionOrigin, openedAt.Valid)
 	}
 	var version int
-	if err := store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 3 {
-		t.Fatalf("continuity migration version = %d, %v; want 3, nil", version, err)
+	if err := store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 4 {
+		t.Fatalf("continuity migration version = %d, %v; want 4, nil", version, err)
 	}
 }
 
@@ -119,8 +122,8 @@ func TestOpenAppliesMigrationOnceAndPersistsBoundedMetric(t *testing.T) {
 		FROM operation_metrics WHERE operation_id = 'op-metric'`).Scan(&migrations, &bytes, &resultCount); err != nil {
 		t.Fatalf("read persisted migration and metric: %v", err)
 	}
-	if migrations != 3 || bytes != len(serialized) || resultCount != 3 {
-		t.Fatalf("migration/metric = %d/%d/%d, want 3/%d/3", migrations, bytes, resultCount, len(serialized))
+	if migrations != 4 || bytes != len(serialized) || resultCount != 3 {
+		t.Fatalf("migration/metric = %d/%d/%d, want 4/%d/3", migrations, bytes, resultCount, len(serialized))
 	}
 	if err := store.Record(t.Context(), telemetry.Operation{
 		OperationID: "op-no-count", RecordedAt: time.Now(), Interface: "mcp", ScopeKind: "library",
@@ -272,5 +275,91 @@ func TestOpenRejectsFutureSchemaWithoutChangingIt(t *testing.T) {
 	}
 	if version != 99 {
 		t.Fatalf("future schema version changed to %d, want 99", version)
+	}
+}
+
+func TestOpenMigratesValidV3DocumentRowsWithoutInventingRevisionProvenance(t *testing.T) {
+	path := testkit.TempSQLitePath(t, "valid-v3-documents")
+	db, err := sql.Open(probeDriver, foreignKeyDSN(path))
+	if err != nil {
+		t.Fatalf("open v3 fixture: %v", err)
+	}
+	for _, schema := range [][]string{foundationSchema, projectSchema, continuitySchema} {
+		for _, statement := range schema {
+			if _, err := db.ExecContext(t.Context(), statement); err != nil {
+				t.Fatalf("apply v3 statement: %v", err)
+			}
+		}
+	}
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+		INSERT INTO schema_migrations(version) VALUES (1), (2), (3);
+		INSERT INTO projects(project_id, display_name) VALUES ('project-a', 'A');
+		INSERT INTO documents(document_id, project_id, current_revision_id) VALUES
+			('document-a', 'project-a', 'revision-a2'), ('document-b', 'project-a', 'revision-b');
+		INSERT INTO revisions(revision_id, document_id, predecessor_revision_id, file_path, checksum, byte_count) VALUES
+			('revision-a', 'document-a', NULL, '/legacy-a.md', 'checksum-a', 6),
+			('revision-a2', 'document-a', 'revision-a', '/legacy-a2.md', 'checksum-a2', 7),
+			('revision-b', 'document-b', NULL, '/legacy-b.md', 'checksum-b', 6);
+		INSERT INTO operations(operation_id, fingerprint, request_fingerprint, project_id, document_id,
+			revision_id, expected_current_revision_id, owner_generation, state, result_outcome, result_revision_id) VALUES
+			('op-committed', '81d530558c8fd18cf52e18ca189c5937d1db14635adb06639f5e5a88facab57c', 'document-write', 'project-a', 'document-a', 'revision-a', NULL, 7, 'committed', 'committed', 'revision-a'),
+			('op-conflict', '81d530558c8fd18cf52e18ca189c5937d1db14635adb06639f5e5a88facab57c', 'document-write', 'project-a', 'document-a', 'revision-a', NULL, 8, 'conflict', 'conflict', NULL);`); err != nil {
+		t.Fatalf("seed valid v3 document fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close v3 fixture: %v", err)
+	}
+
+	store, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open(v3) error = %v", err)
+	}
+	defer store.Close()
+	var workstream, origin, client, model, created sql.NullString
+	if err := store.db.QueryRowContext(t.Context(), `SELECT d.workstream_id, r.origin, r.client_provenance,
+		r.model_provenance, r.created_at FROM documents d JOIN revisions r ON r.document_id = d.document_id
+		WHERE d.document_id = 'document-a'`).Scan(&workstream, &origin, &client, &model, &created); err != nil {
+		t.Fatalf("read migrated v3 document: %v", err)
+	}
+	if workstream.Valid || origin.String != "unknown" || client.Valid || model.Valid || created.Valid {
+		t.Fatalf("migrated document metadata = %v/%q/%v/%v/%v, want NULL scope/client/model/time and unknown origin", workstream.Valid, origin.String, client.Valid, model.Valid, created.Valid)
+	}
+
+	service := app.DocumentService{Store: store, Files: revisionfs.New(t.TempDir(), nil)}
+	limit := 1
+	list := service.Handle(t.Context(), app.Request{Operation: "document.list", Scope: app.Scope{Kind: "project", ProjectID: "project-a"}, Input: []byte(`{}`), Page: &app.Page{Limit: &limit}})
+	history := service.Handle(t.Context(), app.Request{Operation: "document.history", Scope: app.Scope{Kind: "project", ProjectID: "project-a"}, Input: []byte(`{"document_id":"document-a"}`), Page: &app.Page{Limit: &limit}})
+	if list.Outcome != app.OK || list.Page == nil || history.Outcome != app.OK || history.Page == nil {
+		t.Fatalf("migrated list/history = %#v / %#v, want continuations", list, history)
+	}
+	var token struct {
+		ViewRevision int64 `json:"view_revision"`
+	}
+	encoded, err := base64.RawURLEncoding.DecodeString(list.Page.NextToken)
+	if err != nil || json.Unmarshal(encoded, &token) != nil || token.ViewRevision != 0 {
+		t.Fatalf("migrated list token = %q / %#v / %v, want generation 0", list.Page.NextToken, token, err)
+	}
+	if err := store.CreateDocument(t.Context(), "document-c", "project-a"); err != nil {
+		t.Fatalf("CreateDocument(mutate migrated view) error = %v", err)
+	}
+	if replay := service.Handle(t.Context(), app.Request{Operation: "document.list", Scope: app.Scope{Kind: "project", ProjectID: "project-a"}, Input: []byte(`{}`), Page: &app.Page{Limit: &limit, Token: list.Page.NextToken}}); replay.Outcome != app.Conflict {
+		t.Fatalf("migrated list replay outcome = %q, want %q", replay.Outcome, app.Conflict)
+	}
+	if replay := service.Handle(t.Context(), app.Request{Operation: "document.history", Scope: app.Scope{Kind: "project", ProjectID: "project-a"}, Input: []byte(`{"document_id":"document-a"}`), Page: &app.Page{Limit: &limit, Token: history.Page.NextToken}}); replay.Outcome != app.Conflict {
+		t.Fatalf("migrated history replay outcome = %q, want %q", replay.Outcome, app.Conflict)
+	}
+
+	request := OperationRequest{ID: "op-committed", Fingerprint: "document-write", ProjectID: "project-a", DocumentID: "document-a", RevisionID: "revision-a", Markdown: []byte("# baseline\n")}
+	allow := func(context.Context) error { return nil }
+	for id, want := range map[string]string{"op-committed": "committed", "op-conflict": "conflict"} {
+		request.ID = id
+		result, err := store.ExecuteOperation(t.Context(), nil, request, allow)
+		if err != nil || string(result.Outcome) != want {
+			t.Fatalf("ExecuteOperation(%s legacy replay) = %#v, %v; want %s", id, result, err, want)
+		}
+	}
+	request.ID, request.Origin = "op-committed", "cli"
+	if _, err := store.ExecuteOperation(t.Context(), nil, request, allow); !domain.IsOutcome(err, domain.IdempotencyMismatch) {
+		t.Fatalf("ExecuteOperation(changed legacy provenance) error = %v, want %q", err, domain.IdempotencyMismatch)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"memgraphai/internal/domain"
 	"memgraphai/internal/revisionfs"
@@ -26,10 +27,15 @@ type OperationRequest struct {
 	ID              string
 	Fingerprint     string
 	ProjectID       string
+	WorkstreamID    string
 	DocumentID      string
 	RevisionID      string
 	ExpectedCurrent *string
 	Markdown        []byte
+	Origin          string
+	Client          string
+	Model           string
+	CreatedAt       time.Time
 	MaxAttempts     int
 }
 
@@ -165,9 +171,11 @@ func (s *Store) commitOperation(ctx context.Context, request OperationRequest, p
 		predecessor = current.String
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO revisions(
-		revision_id, document_id, predecessor_revision_id, file_path, checksum, byte_count
-	) VALUES (?, ?, ?, ?, ?, ?)`, request.RevisionID, request.DocumentID, predecessor,
-		prepared.Path, prepared.Checksum, prepared.Bytes); err != nil {
+		revision_id, document_id, predecessor_revision_id, file_path, checksum, byte_count,
+		origin, client_provenance, model_provenance, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, request.RevisionID, request.DocumentID, predecessor,
+		prepared.Path, prepared.Checksum, prepared.Bytes, defaultOrigin(request.Origin), nullableValue(request.Client),
+		nullableValue(request.Model), nullableTime(request.CreatedAt)); err != nil {
 		return OperationResult{}, mapRecoveryError(err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE documents SET current_revision_id = ? WHERE document_id = ?`, request.RevisionID, request.DocumentID); err != nil {
@@ -276,6 +284,14 @@ func validateDocumentProjectInTx(ctx context.Context, tx *sql.Tx, projectID, doc
 }
 
 func operationDigest(request OperationRequest) string {
+	if request.WorkstreamID == "" && request.Origin == "" && request.Client == "" && request.Model == "" && request.CreatedAt.IsZero() {
+		return operationDigestV3(request)
+	}
+	return operationDigestV4(request)
+}
+
+// operationDigestV3 preserves the baseline durable identity for legacy rows.
+func operationDigestV3(request OperationRequest) string {
 	markdown := sha256.Sum256(request.Markdown)
 	fields := []string{
 		request.Fingerprint,
@@ -297,8 +313,48 @@ func operationDigest(request OperationRequest) string {
 	return fmt.Sprintf("%x", digest)
 }
 
+func operationDigestV4(request OperationRequest) string {
+	markdown := sha256.Sum256(request.Markdown)
+	fields := []string{
+		request.Fingerprint,
+		request.ProjectID,
+		request.WorkstreamID,
+		request.DocumentID,
+		request.RevisionID,
+		fmt.Sprintf("%x", markdown),
+		defaultOrigin(request.Origin),
+		request.Client,
+		request.Model,
+	}
+	if request.ExpectedCurrent == nil {
+		fields = append(fields, "expected-current:nil")
+	} else {
+		fields = append(fields, "expected-current:value", *request.ExpectedCurrent)
+	}
+	var canonical strings.Builder
+	for _, field := range fields {
+		fmt.Fprintf(&canonical, "%d:%s;", len(field), field)
+	}
+	digest := sha256.Sum256([]byte(canonical.String()))
+	return fmt.Sprintf("%x", digest)
+}
+
 func storedResult(outcome, revision sql.NullString, generation int64) OperationResult {
 	return OperationResult{Outcome: domain.Outcome(outcome.String), RevisionID: revision.String, Generation: generation}
+}
+
+func defaultOrigin(origin string) string {
+	if origin == "" {
+		return "unknown"
+	}
+	return origin
+}
+
+func nullableTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func nullableString(value *string) any {

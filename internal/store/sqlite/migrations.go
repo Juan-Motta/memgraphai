@@ -6,11 +6,13 @@ import (
 	"fmt"
 )
 
-const foundationSchemaVersion = 3
+const foundationSchemaVersion = 4
 
 const projectSchemaVersion = 2
 
 const continuitySchemaVersion = 3
+
+const documentSchemaVersion = 4
 
 var projectSchema = []string{
 	`CREATE TABLE IF NOT EXISTS project_views (
@@ -80,6 +82,36 @@ var continuitySchema = []string{
 	`CREATE TRIGGER IF NOT EXISTS sessions_resume_source_immutable
 		BEFORE UPDATE OF resumed_from_session_id ON sessions
 		BEGIN SELECT RAISE(ABORT, 'session_resume_source_immutable'); END`,
+}
+
+var documentSchema = []string{
+	`ALTER TABLE documents ADD COLUMN workstream_id TEXT REFERENCES workstreams(workstream_id)`,
+	`ALTER TABLE revisions ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'`,
+	`ALTER TABLE revisions ADD COLUMN client_provenance TEXT`,
+	`ALTER TABLE revisions ADD COLUMN model_provenance TEXT`,
+	`ALTER TABLE revisions ADD COLUMN created_at TEXT`,
+	`CREATE TABLE IF NOT EXISTS document_views (
+		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+		generation INTEGER NOT NULL
+	)`,
+	`INSERT OR IGNORE INTO document_views(singleton, generation) VALUES (1, 0)`,
+	`CREATE TRIGGER IF NOT EXISTS documents_identity_scope_immutable
+		BEFORE UPDATE OF document_id, project_id, workstream_id ON documents
+		BEGIN SELECT RAISE(ABORT, 'document_identity_scope_immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS documents_workstream_same_project_insert
+		BEFORE INSERT ON documents WHEN NEW.workstream_id IS NOT NULL
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM workstreams WHERE workstream_id = NEW.workstream_id AND project_id = NEW.project_id)
+			THEN NULL ELSE RAISE(ABORT, 'document_workstream_project_mismatch') END; END`,
+	`CREATE TRIGGER IF NOT EXISTS documents_workstream_same_project_update
+		BEFORE UPDATE OF workstream_id ON documents WHEN NEW.workstream_id IS NOT NULL
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM workstreams WHERE workstream_id = NEW.workstream_id AND project_id = NEW.project_id)
+			THEN NULL ELSE RAISE(ABORT, 'document_workstream_project_mismatch') END; END`,
+	`CREATE TRIGGER IF NOT EXISTS revisions_identity_immutable BEFORE UPDATE ON revisions
+		BEGIN SELECT RAISE(ABORT, 'revision_immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS documents_view_after_insert AFTER INSERT ON documents
+		BEGIN UPDATE document_views SET generation = generation + 1 WHERE singleton = 1; END`,
+	`CREATE TRIGGER IF NOT EXISTS revisions_view_after_insert AFTER INSERT ON revisions
+		BEGIN UPDATE document_views SET generation = generation + 1 WHERE singleton = 1; END`,
 }
 
 var foundationSchema = []string{
@@ -198,6 +230,16 @@ func applyMigrations(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", continuitySchemaVersion); err != nil {
 			return fmt.Errorf("record continuity migration: %w", err)
+		}
+	}
+	if current < documentSchemaVersion {
+		for _, statement := range documentSchema {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply document migration: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", documentSchemaVersion); err != nil {
+			return fmt.Errorf("record document migration: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

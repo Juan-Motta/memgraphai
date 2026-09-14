@@ -150,6 +150,19 @@ func TestPrepareAttemptRejectsNonRegularLeaves(t *testing.T) {
 	}
 }
 
+func TestReadVerifiedReturnsExactBytesFromTheCheckedDescriptor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "revision.md")
+	content := []byte("# exact\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	digest := sha256.Sum256(content)
+	read, err := ReadVerified(path, hex.EncodeToString(digest[:]), int64(len(content)))
+	if err != nil || string(read) != string(content) {
+		t.Fatalf("ReadVerified() = %q, %v; want exact checked bytes", read, err)
+	}
+}
+
 func TestVerifyRejectsSymlinkLeaf(t *testing.T) {
 	outside := filepath.Join(t.TempDir(), "outside.md")
 	content := []byte("# matching\n")

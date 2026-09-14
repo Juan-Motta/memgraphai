@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -136,7 +135,10 @@ func (f *Filesystem) prepare(operationID, generation, projectID, documentID, rev
 }
 
 // Verify checks the exact revision selected by SQLite; it never scans or imports.
-func Verify(path, checksum string, bytes int64) error { return verifyFile(path, checksum, bytes) }
+func Verify(path, checksum string, bytes int64) error {
+	_, err := ReadVerified(path, checksum, bytes)
+	return err
+}
 
 // Orphans returns immutable revision paths not represented by known SQLite metadata.
 // It reports only; callers decide no deletion or import policy here.
@@ -218,31 +220,7 @@ func writeOrVerify(path string, markdown []byte, checksum string) error {
 }
 
 func verifyFile(path, checksum string, bytes int64) error {
-	before, err := os.Lstat(path)
-	if err != nil || !before.Mode().IsRegular() || before.Size() != bytes {
-		return ErrIntegrity
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return ErrIntegrity
-	}
-	defer file.Close()
-
-	opened, err := file.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
-		return ErrIntegrity
-	}
-	after, err := os.Lstat(path)
-	if err != nil || !after.Mode().IsRegular() || !os.SameFile(opened, after) {
-		return ErrIntegrity
-	}
-
-	digest := sha256.New()
-	read, err := io.Copy(digest, file)
-	if err != nil || read != bytes || hex.EncodeToString(digest.Sum(nil)) != checksum {
-		return ErrIntegrity
-	}
-	return nil
+	return Verify(path, checksum, bytes)
 }
 
 func (f *Filesystem) interrupt(point Point) error {
