@@ -6,9 +6,11 @@ import (
 	"fmt"
 )
 
-const foundationSchemaVersion = 2
+const foundationSchemaVersion = 3
 
 const projectSchemaVersion = 2
+
+const continuitySchemaVersion = 3
 
 var projectSchema = []string{
 	`CREATE TABLE IF NOT EXISTS project_views (
@@ -22,6 +24,62 @@ var projectSchema = []string{
 		BEGIN UPDATE project_views SET generation = generation + 1 WHERE singleton = 1; END`,
 	`CREATE TRIGGER IF NOT EXISTS paths_view_after_delete AFTER DELETE ON project_paths
 		BEGIN UPDATE project_views SET generation = generation + 1 WHERE singleton = 1; END`,
+}
+
+var continuitySchema = []string{
+	`ALTER TABLE workstreams ADD COLUMN forked_from_workstream_id TEXT`,
+	`ALTER TABLE workstreams ADD COLUMN created_at TEXT`,
+	`ALTER TABLE workstreams ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'`,
+	`ALTER TABLE workstreams ADD COLUMN client_provenance TEXT`,
+	`ALTER TABLE workstreams ADD COLUMN model_provenance TEXT`,
+	`ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'open'`,
+	`ALTER TABLE sessions ADD COLUMN opened_at TEXT`,
+	`ALTER TABLE sessions ADD COLUMN lifecycle_at TEXT`,
+	`ALTER TABLE sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown'`,
+	`ALTER TABLE sessions ADD COLUMN client_provenance TEXT`,
+	`ALTER TABLE sessions ADD COLUMN model_provenance TEXT`,
+	`ALTER TABLE sessions ADD COLUMN resumed_from_session_id TEXT`,
+	`ALTER TABLE sessions ADD COLUMN disconnect_observed_by TEXT`,
+	`CREATE TABLE IF NOT EXISTS continuity_views (
+		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+		generation INTEGER NOT NULL
+	)`,
+	`INSERT OR IGNORE INTO continuity_views(singleton, generation) VALUES (1, 0)`,
+	`CREATE TRIGGER IF NOT EXISTS workstreams_identity_immutable
+		BEFORE UPDATE OF workstream_id, project_id ON workstreams
+		BEGIN SELECT RAISE(ABORT, 'workstream_identity_immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS workstreams_fork_same_project
+		BEFORE INSERT ON workstreams WHEN NEW.forked_from_workstream_id IS NOT NULL
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM workstreams
+			WHERE workstream_id = NEW.forked_from_workstream_id AND project_id = NEW.project_id)
+			THEN NULL ELSE RAISE(ABORT, 'workstream_fork_project_mismatch') END; END`,
+	`CREATE TRIGGER IF NOT EXISTS workstreams_fork_update_same_project
+		BEFORE UPDATE OF forked_from_workstream_id ON workstreams
+		WHEN NEW.forked_from_workstream_id IS NOT NULL
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM workstreams
+			WHERE workstream_id = NEW.forked_from_workstream_id AND project_id = NEW.project_id)
+			THEN NULL ELSE RAISE(ABORT, 'workstream_fork_project_mismatch') END; END`,
+	`CREATE TRIGGER IF NOT EXISTS workstreams_view_after_insert AFTER INSERT ON workstreams
+		BEGIN UPDATE continuity_views SET generation = generation + 1 WHERE singleton = 1; END`,
+	`CREATE TRIGGER IF NOT EXISTS sessions_identity_immutable
+		BEFORE UPDATE OF session_id, project_id, workstream_id ON sessions
+		BEGIN SELECT RAISE(ABORT, 'session_identity_immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS sessions_status_insert_valid BEFORE INSERT ON sessions
+		WHEN NEW.status NOT IN ('open', 'disconnected', 'closed')
+		BEGIN SELECT RAISE(ABORT, 'session_status_invalid'); END`,
+	`CREATE TRIGGER IF NOT EXISTS sessions_status_transition BEFORE UPDATE OF status ON sessions
+		WHEN NOT ((OLD.status = 'open' AND NEW.status IN ('disconnected', 'closed'))
+			OR (OLD.status = 'disconnected' AND NEW.status = 'closed'))
+		BEGIN SELECT RAISE(ABORT, 'session_status_transition_invalid'); END`,
+	`CREATE TRIGGER IF NOT EXISTS sessions_resume_same_binding
+		BEFORE INSERT ON sessions WHEN NEW.resumed_from_session_id IS NOT NULL
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM sessions
+			WHERE session_id = NEW.resumed_from_session_id AND project_id = NEW.project_id
+			AND workstream_id = NEW.workstream_id)
+			THEN NULL ELSE RAISE(ABORT, 'session_resume_binding_mismatch') END; END`,
+	`CREATE TRIGGER IF NOT EXISTS sessions_resume_source_immutable
+		BEFORE UPDATE OF resumed_from_session_id ON sessions
+		BEGIN SELECT RAISE(ABORT, 'session_resume_source_immutable'); END`,
 }
 
 var foundationSchema = []string{
@@ -130,6 +188,16 @@ func applyMigrations(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", projectSchemaVersion); err != nil {
 			return fmt.Errorf("record project migration: %w", err)
+		}
+	}
+	if current < continuitySchemaVersion {
+		for _, statement := range continuitySchema {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply continuity migration: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", continuitySchemaVersion); err != nil {
+			return fmt.Errorf("record continuity migration: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

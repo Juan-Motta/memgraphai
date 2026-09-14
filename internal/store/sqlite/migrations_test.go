@@ -24,8 +24,61 @@ func TestOpenRecordsFoundationMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read schema migration version: %v", err)
 	}
-	if version != 2 {
-		t.Fatalf("migration version = %d, want 2", version)
+	if version != 3 {
+		t.Fatalf("migration version = %d, want 3", version)
+	}
+}
+
+func TestOpenMigratesValidV2ContinuityRowsWithoutInventingProvenanceOrTime(t *testing.T) {
+	path := testkit.TempSQLitePath(t, "valid-v2-continuity")
+	db, err := sql.Open(probeDriver, foreignKeyDSN(path))
+	if err != nil {
+		t.Fatalf("open v2 fixture: %v", err)
+	}
+	for _, statement := range foundationSchema {
+		if _, err := db.ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("apply valid v1 statement: %v", err)
+		}
+	}
+	for _, statement := range projectSchema {
+		if _, err := db.ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("apply valid v2 statement: %v", err)
+		}
+	}
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+		INSERT INTO schema_migrations(version) VALUES (1), (2);
+		INSERT INTO projects(project_id, display_name) VALUES ('project-a', 'Alpha');
+		INSERT INTO workstreams(workstream_id, project_id) VALUES ('stream-legacy', 'project-a');
+		INSERT INTO sessions(session_id, project_id, workstream_id) VALUES ('session-legacy', 'project-a', 'stream-legacy');`); err != nil {
+		t.Fatalf("seed valid v2 fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close v2 fixture: %v", err)
+	}
+
+	store, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open(v2) error = %v", err)
+	}
+	defer store.Close()
+	var workstreamOrigin string
+	var workstreamCreated sql.NullString
+	if err := store.db.QueryRowContext(t.Context(), `SELECT origin, created_at FROM workstreams
+		WHERE workstream_id = 'stream-legacy'`).Scan(&workstreamOrigin, &workstreamCreated); err != nil {
+		t.Fatalf("read migrated workstream: %v", err)
+	}
+	var status, sessionOrigin string
+	var openedAt sql.NullString
+	if err := store.db.QueryRowContext(t.Context(), `SELECT status, origin, opened_at FROM sessions
+		WHERE session_id = 'session-legacy'`).Scan(&status, &sessionOrigin, &openedAt); err != nil {
+		t.Fatalf("read migrated session: %v", err)
+	}
+	if workstreamOrigin != "unknown" || workstreamCreated.Valid || status != "open" || sessionOrigin != "unknown" || openedAt.Valid {
+		t.Fatalf("migrated legacy metadata = %q/%v/%q/%q/%v, want unknown provenance, open state, and NULL times", workstreamOrigin, workstreamCreated.Valid, status, sessionOrigin, openedAt.Valid)
+	}
+	var version int
+	if err := store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 3 {
+		t.Fatalf("continuity migration version = %d, %v; want 3, nil", version, err)
 	}
 }
 
@@ -66,8 +119,8 @@ func TestOpenAppliesMigrationOnceAndPersistsBoundedMetric(t *testing.T) {
 		FROM operation_metrics WHERE operation_id = 'op-metric'`).Scan(&migrations, &bytes, &resultCount); err != nil {
 		t.Fatalf("read persisted migration and metric: %v", err)
 	}
-	if migrations != 2 || bytes != len(serialized) || resultCount != 3 {
-		t.Fatalf("migration/metric = %d/%d/%d, want 2/%d/3", migrations, bytes, resultCount, len(serialized))
+	if migrations != 3 || bytes != len(serialized) || resultCount != 3 {
+		t.Fatalf("migration/metric = %d/%d/%d, want 3/%d/3", migrations, bytes, resultCount, len(serialized))
 	}
 	if err := store.Record(t.Context(), telemetry.Operation{
 		OperationID: "op-no-count", RecordedAt: time.Now(), Interface: "mcp", ScopeKind: "library",
