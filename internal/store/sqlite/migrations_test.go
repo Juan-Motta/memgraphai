@@ -15,6 +15,24 @@ import (
 	"memgraphai/internal/testkit"
 )
 
+func TestOpenRecordsCheckpointMigrationVersion(t *testing.T) {
+	store, err := Open(t.Context(), testkit.TempSQLitePath(t, "checkpoint-migration-version"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+	var version, checkpoints int
+	if err := store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
+		t.Fatalf("read schema migration version: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'checkpoints'").Scan(&checkpoints); err != nil {
+		t.Fatalf("read checkpoints schema: %v", err)
+	}
+	if version != 7 || checkpoints != 1 {
+		t.Fatalf("checkpoint migration = version %d / table count %d, want 7 / 1", version, checkpoints)
+	}
+}
+
 func TestOpenRecordsFoundationMigrationVersion(t *testing.T) {
 	store, err := Open(t.Context(), testkit.TempSQLitePath(t, "migration-version"))
 	if err != nil {
@@ -27,8 +45,8 @@ func TestOpenRecordsFoundationMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read schema migration version: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("migration version = %d, want 4", version)
+	if version != 7 {
+		t.Fatalf("migration version = %d, want 7", version)
 	}
 }
 
@@ -80,8 +98,8 @@ func TestOpenMigratesValidV2ContinuityRowsWithoutInventingProvenanceOrTime(t *te
 		t.Fatalf("migrated legacy metadata = %q/%v/%q/%q/%v, want unknown provenance, open state, and NULL times", workstreamOrigin, workstreamCreated.Valid, status, sessionOrigin, openedAt.Valid)
 	}
 	var version int
-	if err := store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 4 {
-		t.Fatalf("continuity migration version = %d, %v; want 4, nil", version, err)
+	if err := store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != 7 {
+		t.Fatalf("continuity migration version = %d, %v; want 7, nil", version, err)
 	}
 }
 
@@ -122,8 +140,8 @@ func TestOpenAppliesMigrationOnceAndPersistsBoundedMetric(t *testing.T) {
 		FROM operation_metrics WHERE operation_id = 'op-metric'`).Scan(&migrations, &bytes, &resultCount); err != nil {
 		t.Fatalf("read persisted migration and metric: %v", err)
 	}
-	if migrations != 4 || bytes != len(serialized) || resultCount != 3 {
-		t.Fatalf("migration/metric = %d/%d/%d, want 4/%d/3", migrations, bytes, resultCount, len(serialized))
+	if migrations != 7 || bytes != len(serialized) || resultCount != 3 {
+		t.Fatalf("migration/metric = %d/%d/%d, want 7/%d/3", migrations, bytes, resultCount, len(serialized))
 	}
 	if err := store.Record(t.Context(), telemetry.Operation{
 		OperationID: "op-no-count", RecordedAt: time.Now(), Interface: "mcp", ScopeKind: "library",
@@ -275,6 +293,172 @@ func TestOpenRejectsFutureSchemaWithoutChangingIt(t *testing.T) {
 	}
 	if version != 99 {
 		t.Fatalf("future schema version changed to %d, want 99", version)
+	}
+}
+
+func TestOpenMigratesValidV4ToV7WithoutInventingCheckpoints(t *testing.T) {
+	path := testkit.TempSQLitePath(t, "valid-v4-checkpoint-migration")
+	db, err := sql.Open(probeDriver, foreignKeyDSN(path))
+	if err != nil {
+		t.Fatalf("open v4 fixture: %v", err)
+	}
+	for _, schema := range [][]string{foundationSchema, projectSchema, continuitySchema, documentSchema} {
+		for _, statement := range schema {
+			if _, err := db.ExecContext(t.Context(), statement); err != nil {
+				t.Fatalf("apply valid v4 statement: %v", err)
+			}
+		}
+	}
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+		INSERT INTO schema_migrations(version) VALUES (1), (2), (3), (4);
+		INSERT INTO projects(project_id, display_name) VALUES ('project-a', 'Alpha');
+		INSERT INTO workstreams(workstream_id, project_id, created_at, origin, client_provenance) VALUES
+			('stream-a', 'project-a', '2026-03-01T00:00:00Z', 'legacy-import', 'client-a');
+		INSERT INTO sessions(session_id, project_id, workstream_id, status, opened_at, origin) VALUES
+			('session-a', 'project-a', 'stream-a', 'disconnected', '2026-03-01T00:01:00Z', 'legacy-import');
+		INSERT INTO documents(document_id, project_id, current_revision_id, workstream_id) VALUES
+			('document-general', 'project-a', 'revision-general', NULL),
+			('document-stream', 'project-a', 'revision-stream', 'stream-a');
+		INSERT INTO revisions(revision_id, document_id, predecessor_revision_id, file_path, checksum, byte_count, origin, client_provenance, created_at) VALUES
+			('revision-general', 'document-general', NULL, '/legacy/general.md', 'general-checksum', 17, 'legacy-import', 'client-a', '2026-03-01T00:02:00Z'),
+			('revision-stream', 'document-stream', NULL, '/legacy/stream.md', 'stream-checksum', 16, 'legacy-import', 'client-a', '2026-03-01T00:03:00Z');
+		INSERT INTO operations(operation_id, fingerprint, request_fingerprint, project_id, document_id, revision_id,
+			expected_current_revision_id, owner_generation, state, result_outcome, result_revision_id) VALUES
+			('operation-a', 'external-fingerprint', 'canonical-fingerprint', 'project-a', 'document-stream', 'revision-stream',
+				NULL, 4, 'committed', 'ok', 'revision-stream');`); err != nil {
+		t.Fatalf("seed valid v4 fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close v4 fixture: %v", err)
+	}
+
+	store, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open(v4) error = %v", err)
+	}
+	defer store.Close()
+
+	var versions, constraints string
+	if err := store.db.QueryRowContext(t.Context(), `SELECT group_concat(version, '|')
+		FROM (SELECT version FROM schema_migrations ORDER BY version)`).Scan(&versions); err != nil {
+		t.Fatalf("read migration ledger: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), `SELECT group_concat(name, '|') FROM (
+		SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (
+			'checkpoints_immutable', 'checkpoints_session_binding', 'checkpoints_backing_revision',
+			'checkpoint_references_exact_scope', 'checkpoints_delete_immutable',
+			'checkpoint_references_update_immutable', 'checkpoint_references_delete_immutable',
+			'checkpoint_references_insert_immutable'
+		) ORDER BY name)`).Scan(&constraints); err != nil {
+		t.Fatalf("read checkpoint constraints: %v", err)
+	}
+	if versions != "1|2|3|4|5|6|7" || constraints != "checkpoint_references_delete_immutable|checkpoint_references_exact_scope|checkpoint_references_insert_immutable|checkpoint_references_update_immutable|checkpoints_backing_revision|checkpoints_delete_immutable|checkpoints_immutable|checkpoints_session_binding" {
+		t.Fatalf("migration ledger/constraints = %q/%q, want complete v1-v7 ledger and checkpoint constraints", versions, constraints)
+	}
+
+	var project, sessionStatus, sessionOrigin, generalCurrent, streamCurrent string
+	var sessionWorkstream, streamWorkstream, revisionPath, revisionChecksum, revisionOrigin string
+	var operationFingerprint, operationRequest, operationProject, operationDocument, operationRevision, operationState, operationResult string
+	var generation, bytes int
+	if err := store.db.QueryRowContext(t.Context(), "SELECT display_name FROM projects WHERE project_id = 'project-a'").Scan(&project); err != nil {
+		t.Fatalf("read migrated project: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), "SELECT workstream_id, status, origin FROM sessions WHERE session_id = 'session-a'").Scan(&sessionWorkstream, &sessionStatus, &sessionOrigin); err != nil {
+		t.Fatalf("read migrated session: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), "SELECT current_revision_id FROM documents WHERE document_id = 'document-general'").Scan(&generalCurrent); err != nil {
+		t.Fatalf("read migrated general document: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), "SELECT workstream_id, current_revision_id FROM documents WHERE document_id = 'document-stream'").Scan(&streamWorkstream, &streamCurrent); err != nil {
+		t.Fatalf("read migrated stream document: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), "SELECT file_path, checksum, byte_count, origin FROM revisions WHERE revision_id = 'revision-stream'").Scan(&revisionPath, &revisionChecksum, &bytes, &revisionOrigin); err != nil {
+		t.Fatalf("read migrated revision: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), `SELECT fingerprint, request_fingerprint, project_id, document_id,
+		revision_id, owner_generation, state, result_revision_id FROM operations WHERE operation_id = 'operation-a'`).Scan(
+		&operationFingerprint, &operationRequest, &operationProject, &operationDocument, &operationRevision,
+		&generation, &operationState, &operationResult,
+	); err != nil {
+		t.Fatalf("read migrated operation: %v", err)
+	}
+	if project != "Alpha" || sessionWorkstream != "stream-a" || sessionStatus != "disconnected" || sessionOrigin != "legacy-import" || generalCurrent != "revision-general" || streamWorkstream != "stream-a" || streamCurrent != "revision-stream" || revisionPath != "/legacy/stream.md" || revisionChecksum != "stream-checksum" || bytes != 16 || revisionOrigin != "legacy-import" || operationFingerprint != "external-fingerprint" || operationRequest != "canonical-fingerprint" || operationProject != "project-a" || operationDocument != "document-stream" || operationRevision != "revision-stream" || generation != 4 || operationState != "committed" || operationResult != "revision-stream" {
+		t.Fatal("v4 project, session, document, revision, or operation row changed during migration")
+	}
+	var checkpoints, references int
+	if err := store.db.QueryRowContext(t.Context(), "SELECT count(*) FROM checkpoints").Scan(&checkpoints); err != nil {
+		t.Fatalf("read migrated checkpoints: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), "SELECT count(*) FROM checkpoint_references").Scan(&references); err != nil {
+		t.Fatalf("read migrated checkpoint references: %v", err)
+	}
+	if checkpoints != 0 || references != 0 {
+		t.Fatalf("v4 migration invented checkpoints/references = %d/%d, want 0/0", checkpoints, references)
+	}
+}
+
+func TestOpenMigratesValidV5ToV7AddingCheckpointGuards(t *testing.T) {
+	path := testkit.TempSQLitePath(t, "valid-v5-checkpoint-guards")
+	db, err := sql.Open(probeDriver, foreignKeyDSN(path))
+	if err != nil {
+		t.Fatalf("open v5 fixture: %v", err)
+	}
+	for _, schema := range [][]string{foundationSchema, projectSchema, continuitySchema, documentSchema, checkpointSchema} {
+		for _, statement := range schema {
+			if _, err := db.ExecContext(t.Context(), statement); err != nil {
+				t.Fatalf("apply v5 statement: %v", err)
+			}
+		}
+	}
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY NOT NULL);
+		INSERT INTO schema_migrations(version) VALUES (1), (2), (3), (4), (5);
+		INSERT INTO projects(project_id, display_name) VALUES ('project-a', 'A');
+		INSERT INTO workstreams(workstream_id, project_id, origin) VALUES ('stream-a', 'project-a', 'legacy');
+		INSERT INTO sessions(session_id, project_id, workstream_id, status, origin) VALUES ('session-a', 'project-a', 'stream-a', 'open', 'legacy');
+		INSERT INTO documents(document_id, project_id, current_revision_id, workstream_id) VALUES
+			('checkpoint-document', 'project-a', 'checkpoint-revision', 'stream-a'),
+			('source-a', 'project-a', 'source-revision-a', NULL), ('source-b', 'project-a', 'source-revision-b', NULL);
+		INSERT INTO revisions(revision_id, document_id, file_path, checksum, byte_count, origin) VALUES
+			('checkpoint-revision', 'checkpoint-document', '/checkpoint.md', 'checkpoint-sum', 10, 'legacy'),
+			('source-revision-a', 'source-a', '/source-a.md', 'source-a-sum', 8, 'legacy'),
+			('source-revision-b', 'source-b', '/source-b.md', 'source-b-sum', 8, 'legacy');
+		INSERT INTO checkpoints(checkpoint_id, checkpoint_document_id, checkpoint_revision_id, project_id,
+			workstream_id, session_id, origin, created_at) VALUES
+			('checkpoint-a', 'checkpoint-document', 'checkpoint-revision', 'project-a', 'stream-a', 'session-a', 'legacy', '2026-03-01T00:00:00Z');
+		INSERT INTO checkpoint_references(checkpoint_id, document_id, revision_id) VALUES
+			('checkpoint-a', 'source-a', 'source-revision-a');
+		INSERT INTO operations(operation_id, fingerprint, request_fingerprint, project_id, document_id, revision_id, state) VALUES
+			('checkpoint-operation', 'digest', 'checkpoint-save', 'project-a', 'checkpoint-document', 'checkpoint-revision', 'committed');`); err != nil {
+		t.Fatalf("seed valid v5 fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close v5 fixture: %v", err)
+	}
+	store, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open(v5) error = %v", err)
+	}
+	defer store.Close()
+	var version, checkpoints, references int
+	if err := store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
+		t.Fatalf("read v6 version: %v", err)
+	}
+	if err := store.db.QueryRowContext(t.Context(), `SELECT
+		(SELECT count(*) FROM checkpoints), (SELECT count(*) FROM checkpoint_references)`).Scan(&checkpoints, &references); err != nil {
+		t.Fatalf("read migrated checkpoint aggregate: %v", err)
+	}
+	var guards int
+	if err := store.db.QueryRowContext(t.Context(), `SELECT count(*) FROM sqlite_master
+		WHERE type = 'trigger' AND name IN ('checkpoints_delete_immutable', 'checkpoint_references_insert_immutable',
+			'checkpoint_references_update_immutable', 'checkpoint_references_delete_immutable')`).Scan(&guards); err != nil {
+		t.Fatalf("read checkpoint guards: %v", err)
+	}
+	if version != 7 || checkpoints != 1 || references != 1 || guards != 4 {
+		t.Fatalf("v5 to v7 migration = %d/%d/%d/%d, want 7/1/1/4", version, checkpoints, references, guards)
+	}
+	if _, err := store.db.ExecContext(t.Context(), `INSERT INTO checkpoint_references(checkpoint_id, document_id, revision_id)
+		VALUES ('checkpoint-a', 'source-b', 'source-revision-b')`); err == nil {
+		t.Fatal("append to migrated published checkpoint error = nil, want rejection")
 	}
 }
 

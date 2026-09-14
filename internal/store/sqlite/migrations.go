@@ -6,13 +6,19 @@ import (
 	"fmt"
 )
 
-const foundationSchemaVersion = 4
+const foundationSchemaVersion = 7
 
 const projectSchemaVersion = 2
 
 const continuitySchemaVersion = 3
 
 const documentSchemaVersion = 4
+
+const checkpointSchemaVersion = 5
+
+const checkpointHardeningSchemaVersion = 6
+
+const checkpointPublicationSealSchemaVersion = 7
 
 var projectSchema = []string{
 	`CREATE TABLE IF NOT EXISTS project_views (
@@ -112,6 +118,63 @@ var documentSchema = []string{
 		BEGIN UPDATE document_views SET generation = generation + 1 WHERE singleton = 1; END`,
 	`CREATE TRIGGER IF NOT EXISTS revisions_view_after_insert AFTER INSERT ON revisions
 		BEGIN UPDATE document_views SET generation = generation + 1 WHERE singleton = 1; END`,
+}
+
+var checkpointSchema = []string{
+	`CREATE TABLE IF NOT EXISTS checkpoints (
+		checkpoint_id TEXT PRIMARY KEY NOT NULL,
+		checkpoint_document_id TEXT NOT NULL UNIQUE REFERENCES documents(document_id),
+		checkpoint_revision_id TEXT NOT NULL UNIQUE REFERENCES revisions(revision_id),
+		project_id TEXT NOT NULL REFERENCES projects(project_id),
+		workstream_id TEXT NOT NULL REFERENCES workstreams(workstream_id),
+		session_id TEXT NOT NULL REFERENCES sessions(session_id),
+		origin TEXT NOT NULL,
+		client_provenance TEXT,
+		model_provenance TEXT,
+		created_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS checkpoint_references (
+		checkpoint_id TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
+		document_id TEXT NOT NULL REFERENCES documents(document_id),
+		revision_id TEXT NOT NULL REFERENCES revisions(revision_id),
+		PRIMARY KEY (checkpoint_id, document_id, revision_id)
+	)`,
+	`CREATE TRIGGER IF NOT EXISTS checkpoints_immutable BEFORE UPDATE ON checkpoints
+		BEGIN SELECT RAISE(ABORT, 'checkpoint_immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS checkpoints_session_binding BEFORE INSERT ON checkpoints
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM sessions WHERE session_id = NEW.session_id
+			AND project_id = NEW.project_id AND workstream_id = NEW.workstream_id)
+			THEN NULL ELSE RAISE(ABORT, 'checkpoint_session_binding_mismatch') END; END`,
+	`CREATE TRIGGER IF NOT EXISTS checkpoints_backing_revision BEFORE INSERT ON checkpoints
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM revisions r JOIN documents d ON d.document_id = r.document_id
+			WHERE r.revision_id = NEW.checkpoint_revision_id AND d.document_id = NEW.checkpoint_document_id
+			AND d.project_id = NEW.project_id AND d.workstream_id = NEW.workstream_id)
+			THEN NULL ELSE RAISE(ABORT, 'checkpoint_backing_revision_mismatch') END; END`,
+	`CREATE TRIGGER IF NOT EXISTS checkpoint_references_exact_scope BEFORE INSERT ON checkpoint_references
+		BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM checkpoints c JOIN revisions r ON r.revision_id = NEW.revision_id
+			JOIN documents d ON d.document_id = r.document_id WHERE c.checkpoint_id = NEW.checkpoint_id
+			AND d.document_id = NEW.document_id AND d.project_id = c.project_id
+			AND (d.workstream_id IS NULL OR d.workstream_id = c.workstream_id))
+			THEN NULL ELSE RAISE(ABORT, 'checkpoint_reference_scope_mismatch') END; END`,
+}
+
+var checkpointHardeningSchema = []string{
+	`CREATE TRIGGER IF NOT EXISTS checkpoints_delete_immutable BEFORE DELETE ON checkpoints
+		BEGIN SELECT RAISE(ABORT, 'checkpoint_immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS checkpoint_references_update_immutable BEFORE UPDATE ON checkpoint_references
+		BEGIN SELECT RAISE(ABORT, 'checkpoint_reference_immutable'); END`,
+	`CREATE TRIGGER IF NOT EXISTS checkpoint_references_delete_immutable BEFORE DELETE ON checkpoint_references
+		BEGIN SELECT RAISE(ABORT, 'checkpoint_reference_immutable'); END`,
+}
+
+var checkpointPublicationSealSchema = []string{
+	`CREATE TRIGGER IF NOT EXISTS checkpoint_references_insert_immutable
+		BEFORE INSERT ON checkpoint_references
+		WHEN EXISTS(SELECT 1 FROM checkpoints c JOIN operations o
+			ON o.document_id = c.checkpoint_document_id
+			AND o.revision_id = c.checkpoint_revision_id
+			WHERE c.checkpoint_id = NEW.checkpoint_id AND o.state IN ('committed', 'conflict'))
+		BEGIN SELECT RAISE(ABORT, 'checkpoint_reference_immutable'); END`,
 }
 
 var foundationSchema = []string{
@@ -240,6 +303,36 @@ func applyMigrations(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", documentSchemaVersion); err != nil {
 			return fmt.Errorf("record document migration: %w", err)
+		}
+	}
+	if current < checkpointSchemaVersion {
+		for _, statement := range checkpointSchema {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply checkpoint migration: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", checkpointSchemaVersion); err != nil {
+			return fmt.Errorf("record checkpoint migration: %w", err)
+		}
+	}
+	if current < checkpointHardeningSchemaVersion {
+		for _, statement := range checkpointHardeningSchema {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply checkpoint hardening migration: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", checkpointHardeningSchemaVersion); err != nil {
+			return fmt.Errorf("record checkpoint hardening migration: %w", err)
+		}
+	}
+	if current < checkpointPublicationSealSchemaVersion {
+		for _, statement := range checkpointPublicationSealSchema {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply checkpoint publication seal migration: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", checkpointPublicationSealSchemaVersion); err != nil {
+			return fmt.Errorf("record checkpoint publication seal migration: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
