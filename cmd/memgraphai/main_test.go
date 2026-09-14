@@ -227,6 +227,64 @@ func TestDocumentCLIReplayRemainsReachableAfterDiscardedResponse(t *testing.T) {
 	}
 }
 
+func TestCheckpointCLIProcessUsesHumanAndJSON(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "memgraphai")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+	library := t.TempDir()
+	runJSON := func(id, operation string, scope, input map[string]any) map[string]any {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]any{"contract_version": "memgraphai.experimental/v1alpha1", "operation_id": id, "operation": operation, "scope": scope, "input": input})
+		command := exec.Command(binary, "--library", library, "--json")
+		command.Stdin = bytes.NewReader(raw)
+		output, err := command.CombinedOutput()
+		var response map[string]any
+		if decodeErr := json.Unmarshal(output, &response); decodeErr != nil {
+			t.Fatalf("decode %s response %q: %v", operation, output, decodeErr)
+		}
+		if code := response["outcome"].(map[string]any)["code"]; (code == "ok") != (err == nil) {
+			t.Fatalf("JSON %s = %v/%#v", operation, err, response)
+		}
+		return response
+	}
+	libraryScope := map[string]any{"kind": "library"}
+	projectScope := map[string]any{"kind": "project", "project_id": "project-a"}
+	workstreamScope := map[string]any{"kind": "workstream", "project_id": "project-a", "workstream_id": "workstream-a"}
+	sessionScope := map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-a", "session_id": "session-a"}
+	runJSON("checkpoint-project", "project.create", libraryScope, map[string]any{"project_id": "project-a", "name": "Alpha"})
+	runJSON("checkpoint-workstream", "workstream.create", projectScope, map[string]any{"workstream_id": "workstream-a", "origin": "cli"})
+	runJSON("checkpoint-session", "session.open", workstreamScope, map[string]any{"session_id": "session-a", "origin": "cli"})
+	runJSON("checkpoint-source", "document.create", projectScope, map[string]any{"document_id": "source-a", "revision_id": "source-r1", "expected_revision_id": nil, "content_base64": "AP9zb3VyY2UK", "provenance": map[string]any{"origin": "cli"}})
+	humanSave := []string{"--library", library, "--operation-id", "checkpoint-human-save", "checkpoint", "save", "--project-id", "project-a", "--workstream-id", "workstream-a", "--session-id", "session-a", "--checkpoint-id", "checkpoint-human", "--checkpoint-document-id", "checkpoint-document-human", "--checkpoint-revision-id", "checkpoint-revision-human", "--prose-base64", "AP9oYW5kb2ZmCg", "--reference-document-id", "source-a", "--reference-revision-id", "source-r1", "--provenance-origin", "shell"}
+	if output, err := exec.Command(binary, humanSave...).CombinedOutput(); err != nil || string(output) != "ok\n" {
+		t.Fatalf("human checkpoint save = %v/%q, want exact ok newline", err, output)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(library, "database.sqlite"))
+	if err != nil {
+		t.Fatalf("open checkpoint metrics database: %v", err)
+	}
+	defer db.Close()
+	var recorded int
+	if err := db.QueryRow("SELECT response_bytes FROM operation_metrics WHERE operation_id = 'checkpoint-human-save'").Scan(&recorded); err != nil || recorded != len("ok\n") {
+		t.Fatalf("checkpoint human response metric = %d, %v; want exact newline-delimited bytes", recorded, err)
+	}
+	read := runJSON("checkpoint-json-read", "checkpoint.read", sessionScope, map[string]any{"checkpoint_id": "checkpoint-human"})
+	result := read["result"].(map[string]any)
+	if result["prose_base64"] != "AP9oYW5kb2ZmCg" || result["references"].([]any)[0].(map[string]any)["fresh"] != true || result["provenance"].(map[string]any)["origin"] != "shell" {
+		t.Fatalf("JSON checkpoint read = %#v, want exact bytes, fresh reference, and provenance", result)
+	}
+	runJSON("checkpoint-json-save", "checkpoint.save", sessionScope, map[string]any{"checkpoint_id": "checkpoint-json", "checkpoint_document_id": "checkpoint-document-json", "checkpoint_revision_id": "checkpoint-revision-json", "prose_base64": "anNvbiBoYW5kb2ZmCg", "references": []map[string]any{{"document_id": "source-a", "revision_id": "source-r1"}}, "provenance": map[string]any{"origin": "json", "client": "test"}})
+	humanRead := []string{"--library", library, "--operation-id", "checkpoint-human-read", "checkpoint", "read", "--project-id", "project-a", "--workstream-id", "workstream-a", "--session-id", "session-a", "--checkpoint-id", "checkpoint-json"}
+	if output, err := exec.Command(binary, humanRead...).CombinedOutput(); err != nil || string(output) != "ok\n" {
+		t.Fatalf("human checkpoint read = %v/%q, want exact ok newline", err, output)
+	}
+	wrongBinding := runJSON("checkpoint-wrong-binding", "checkpoint.read", map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "wrong-workstream", "session_id": "session-a"}, map[string]any{"checkpoint_id": "checkpoint-json"})
+	if got := wrongBinding["outcome"].(map[string]any)["code"]; got != "binding_mismatch" {
+		t.Fatalf("mismatched JSON checkpoint read outcome = %q, want binding_mismatch", got)
+	}
+}
+
 func TestCommandRejectsAnUnknownArgument(t *testing.T) {
 	command := exec.Command("go", "run", ".", "unknown")
 	output, err := command.CombinedOutput()

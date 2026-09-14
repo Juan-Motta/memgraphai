@@ -26,6 +26,14 @@ type checkpointReference struct {
 	Fresh      bool   `json:"fresh,omitempty"`
 }
 
+// checkpointResponseReference is intentionally separate from checkpointReference:
+// persisted request bytes retain their canonical, compatibility-sensitive encoding.
+type checkpointResponseReference struct {
+	DocumentID string `json:"document_id"`
+	RevisionID string `json:"revision_id"`
+	Fresh      bool   `json:"fresh"`
+}
+
 type checkpointClaim struct {
 	generation int64
 	outcome    domain.Outcome
@@ -202,9 +210,9 @@ func (s *Store) ReadCheckpoint(ctx context.Context, files *revisionfs.Filesystem
 		return nil, mapRecoveryError(err)
 	}
 	defer rows.Close()
-	references := make([]checkpointReference, 0)
+	references := make([]checkpointResponseReference, 0)
 	for rows.Next() {
-		var reference checkpointReference
+		var reference checkpointResponseReference
 		var fresh int
 		if err := rows.Scan(&reference.DocumentID, &reference.RevisionID, &fresh); err != nil {
 			return nil, mapRecoveryError(err)

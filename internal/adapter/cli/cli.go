@@ -55,6 +55,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out io.Writer, errOut
 	projects := app.ProjectService{Store: store}
 	continuity := app.ContinuityService{Store: store}
 	documents := app.DocumentService{Store: store, Files: revisionfs.New(root, nil)}
+	checkpoints := app.CheckpointService{Store: store, Files: revisionfs.New(root, nil)}
 	handler := projects.Handle
 	if request, code := app.ParseRequest(raw); code == "" {
 		switch {
@@ -62,6 +63,8 @@ func Run(ctx context.Context, args []string, in io.Reader, out io.Writer, errOut
 			handler = continuity.Handle
 		case strings.HasPrefix(request.Operation, "document."):
 			handler = documents.Handle
+		case strings.HasPrefix(request.Operation, "checkpoint."):
+			handler = checkpoints.Handle
 		}
 	}
 	started := time.Now()
@@ -118,6 +121,9 @@ func commandRequest(operationID string, args []string) ([]byte, error) {
 	if strings.HasPrefix(operation, "document.") {
 		return documentCommandRequest(operationID, operation, args)
 	}
+	if strings.HasPrefix(operation, "checkpoint.") {
+		return checkpointCommandRequest(operationID, operation, args)
+	}
 	scope := app.Scope{Kind: "library"}
 	input := map[string]string{}
 	var page *app.Page
@@ -159,7 +165,7 @@ func commandOperation(args []string) (string, []string, error) {
 			return "project.association." + args[2], args[3:], nil
 		}
 		return "project." + args[1], args[2:], nil
-	case "workstream", "session", "document":
+	case "workstream", "session", "document", "checkpoint":
 		return args[0] + "." + args[1], args[2:], nil
 	default:
 		return "", nil, errors.New("unknown command")
@@ -212,6 +218,57 @@ func documentCommandRequest(operationID, operation string, args []string) ([]byt
 	}
 	inputJSON, _ := json.Marshal(input)
 	return json.Marshal(app.Request{ContractVersion: app.ContractVersion, OperationID: operationID, Operation: operation, Scope: scope, Input: inputJSON, Page: page})
+}
+
+func checkpointCommandRequest(operationID, operation string, args []string) ([]byte, error) {
+	if operation != "checkpoint.save" && operation != "checkpoint.read" {
+		return nil, errors.New("unknown checkpoint command")
+	}
+	scope := app.Scope{Kind: "session"}
+	input := map[string]any{}
+	provenance := map[string]string{}
+	references := make([]map[string]string, 0)
+	for len(args) > 0 {
+		if len(args) < 2 || !strings.HasPrefix(args[0], "--") {
+			return nil, errors.New("invalid checkpoint argument")
+		}
+		key, value := strings.TrimPrefix(args[0], "--"), args[1]
+		switch key {
+		case "project-id":
+			scope.ProjectID = value
+		case "workstream-id":
+			scope.WorkstreamID = value
+		case "session-id":
+			scope.SessionID = value
+		case "checkpoint-id", "checkpoint-document-id", "checkpoint-revision-id", "prose-base64":
+			input[strings.ReplaceAll(key, "-", "_")] = value
+		case "reference-document-id":
+			references = append(references, map[string]string{"document_id": value})
+		case "reference-revision-id":
+			if len(references) == 0 || references[len(references)-1]["revision_id"] != "" {
+				return nil, errors.New("reference revision must follow a document")
+			}
+			references[len(references)-1]["revision_id"] = value
+		case "provenance-origin", "provenance-client", "provenance-model":
+			provenance[strings.TrimPrefix(key, "provenance-")] = value
+		default:
+			return nil, errors.New("invalid checkpoint argument")
+		}
+		args = args[2:]
+	}
+	if operation == "checkpoint.save" {
+		for _, reference := range references {
+			if reference["revision_id"] == "" {
+				return nil, errors.New("reference document requires a revision")
+			}
+		}
+		input["references"] = references
+		input["provenance"] = provenance
+	} else if len(references) != 0 || len(provenance) != 0 {
+		return nil, errors.New("checkpoint read has no references or provenance")
+	}
+	inputJSON, _ := json.Marshal(input)
+	return json.Marshal(app.Request{ContractVersion: app.ContractVersion, OperationID: operationID, Operation: operation, Scope: scope, Input: inputJSON})
 }
 
 func setContinuityScope(scope *app.Scope, operation, key, value string, input map[string]string) {

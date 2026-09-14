@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,8 +44,8 @@ func TestStdioServerListsAndCallsProjectTool(t *testing.T) {
 		_ = session.Wait()
 	})
 	tools, err := session.ListTools(t.Context(), nil)
-	if err != nil || len(tools.Tools) != 19 {
-		t.Fatalf("ListTools() = %d, %v; want nineteen project, continuity, and document tools", len(tools.Tools), err)
+	if err != nil || len(tools.Tools) != 21 {
+		t.Fatalf("ListTools() = %d, %v; want twenty-one project, continuity, document, and checkpoint tools", len(tools.Tools), err)
 	}
 	path := filepath.Join(t.TempDir(), "associated")
 	if err := os.Mkdir(path, 0o755); err != nil {
@@ -184,8 +185,8 @@ func TestStdioServerListsAndCallsContinuityTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools() error = %v", err)
 	}
-	if len(tools.Tools) != 19 {
-		t.Fatalf("ListTools() = %d tools, want 19 project, continuity, and document tools", len(tools.Tools))
+	if len(tools.Tools) != 21 {
+		t.Fatalf("ListTools() = %d tools, want 21 project, continuity, document, and checkpoint tools", len(tools.Tools))
 	}
 	call := func(name, id string, scope, input map[string]any) map[string]any {
 		t.Helper()
@@ -421,8 +422,8 @@ func TestStdioServerExposesDocumentToolsAndExactBytes(t *testing.T) {
 		_ = session.Wait()
 	})
 	tools, err := session.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 19 {
-		t.Fatalf("ListTools() = %d, %v; want nineteen project, continuity, and document tools", len(tools.Tools), err)
+	if err != nil || len(tools.Tools) != 21 {
+		t.Fatalf("ListTools() = %d, %v; want twenty-one project, continuity, document, and checkpoint tools", len(tools.Tools), err)
 	}
 	call := func(name, id string, scope, input map[string]any) map[string]any {
 		t.Helper()
@@ -494,6 +495,19 @@ func TestMCPMetricEqualsIndependentlyCapturedJSONRPCFrame(t *testing.T) {
 				t.Fatalf("document fixture project: %v", err)
 			}
 		}},
+		{"checkpoint", "wire-checkpoint", "checkpoint.save", map[string]any{"kind": "session", "project_id": "project-wire", "workstream_id": "workstream-wire", "session_id": "session-wire"}, map[string]any{"checkpoint_id": "checkpoint-wire", "checkpoint_document_id": "checkpoint-document-wire", "checkpoint_revision_id": "checkpoint-revision-wire", "prose_base64": "d2lyZQ", "references": []map[string]any{{"document_id": "source-wire", "revision_id": "source-revision-wire"}}, "provenance": map[string]any{"origin": "wire"}}, func(ctx context.Context, session *gomcp.ClientSession) {
+			call := func(name, id string, scope, input map[string]any) {
+				t.Helper()
+				called, err := session.CallTool(ctx, &gomcp.CallToolParams{Name: name, Arguments: map[string]any{"contract_version": app.ContractVersion, "operation_id": id, "scope": scope, "input": input}})
+				if err != nil || called.IsError {
+					t.Fatalf("checkpoint metric fixture %s = %v/%t", name, err, called != nil && called.IsError)
+				}
+			}
+			call("project.create", "wire-checkpoint-project", map[string]any{"kind": "library"}, map[string]any{"project_id": "project-wire", "name": "Wire"})
+			call("workstream.create", "wire-checkpoint-workstream", map[string]any{"kind": "project", "project_id": "project-wire"}, map[string]any{"workstream_id": "workstream-wire", "origin": "wire"})
+			call("session.open", "wire-checkpoint-session", map[string]any{"kind": "workstream", "project_id": "project-wire", "workstream_id": "workstream-wire"}, map[string]any{"session_id": "session-wire", "origin": "wire"})
+			call("document.create", "wire-checkpoint-source", map[string]any{"kind": "project", "project_id": "project-wire"}, map[string]any{"document_id": "source-wire", "revision_id": "source-revision-wire", "expected_revision_id": nil, "content_base64": "d2lyZQ", "provenance": map[string]any{"origin": "wire"}})
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -508,7 +522,8 @@ func TestMCPMetricEqualsIndependentlyCapturedJSONRPCFrame(t *testing.T) {
 			capture := &frameCapture{WriteCloser: serverOut}
 			serverDone := make(chan error, 1)
 			go func() {
-				serverDone <- RunIO(ctx, app.ProjectService{Store: store}, app.ContinuityService{Store: store}, app.DocumentService{Store: store, Files: revisionfs.New(filepath.Dir(storePath), nil)}, app.Service{Recorder: store}, serverIn, capture)
+				files := revisionfs.New(filepath.Dir(storePath), nil)
+				serverDone <- RunIO(ctx, app.ProjectService{Store: store}, app.ContinuityService{Store: store}, app.DocumentService{Store: store, Files: files}, app.Service{Recorder: store}, serverIn, capture, app.CheckpointService{Store: store, Files: files})
 			}()
 			session, err := gomcp.NewClient(&gomcp.Implementation{Name: "wire-test", Version: "v1alpha1"}, nil).Connect(ctx, &gomcp.IOTransport{Reader: clientIn, Writer: clientOut}, nil)
 			if err != nil {
@@ -567,8 +582,14 @@ func (c *frameCapture) frameContaining(operationID string) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, frame := range bytes.SplitAfter(c.buf.Bytes(), []byte{'\n'}) {
-		if bytes.Contains(frame, []byte(operationID)) {
-			return append([]byte(nil), frame...)
+		var response any
+		if json.Unmarshal(frame, &response) != nil {
+			continue
+		}
+		for _, id := range responseOperationIDs(response) {
+			if id == operationID {
+				return append([]byte(nil), frame...)
+			}
 		}
 	}
 	return nil
@@ -812,6 +833,175 @@ func documentSemanticEnvelope(value map[string]any) map[string]any {
 	}
 	visit(copy)
 	return copy
+}
+
+func TestStdioServerExposesCheckpointSaveAndReadTools(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	binary := filepath.Join(t.TempDir(), "memgraphai")
+	if output, err := exec.Command("go", "build", "-o", binary, "../../../cmd/memgraphai").CombinedOutput(); err != nil {
+		t.Fatalf("build server: %v\n%s", err, output)
+	}
+	client := gomcp.NewClient(&gomcp.Implementation{Name: "checkpoints-test", Version: "v1alpha1"}, nil)
+	command := exec.CommandContext(ctx, binary, "mcp", "--library", t.TempDir())
+	session, err := client.Connect(ctx, &gomcp.CommandTransport{Command: command, TerminateDuration: 250 * time.Millisecond}, nil)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer func() {
+		_ = session.Close()
+		_ = session.Wait()
+	}()
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil || len(tools.Tools) != 21 {
+		t.Fatalf("ListTools() = %d, %v; want twenty-one tools including checkpoint save/read", len(tools.Tools), err)
+	}
+}
+
+func TestCheckpointAdaptersHaveEquivalentProcessOutcomes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	binary := filepath.Join(t.TempDir(), "memgraphai")
+	if output, err := exec.Command("go", "build", "-o", binary, "../../../cmd/memgraphai").CombinedOutput(); err != nil {
+		t.Fatalf("build binary: %v\n%s", err, output)
+	}
+	cliRoot, mcpRoot := t.TempDir(), t.TempDir()
+	cliCall := func(id, operation string, scope, input map[string]any) map[string]any {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]any{"contract_version": app.ContractVersion, "operation_id": id, "operation": operation, "scope": scope, "input": input})
+		command := exec.CommandContext(ctx, binary, "--library", cliRoot, "--json")
+		command.Stdin = bytes.NewReader(raw)
+		output, _ := command.CombinedOutput()
+		var response map[string]any
+		if err := json.Unmarshal(output, &response); err != nil {
+			t.Fatalf("decode CLI %s response %q: %v", operation, output, err)
+		}
+		return response
+	}
+	client := gomcp.NewClient(&gomcp.Implementation{Name: "checkpoint-parity", Version: "v1alpha1"}, nil)
+	session, err := client.Connect(ctx, &gomcp.CommandTransport{Command: exec.CommandContext(ctx, binary, "mcp", "--library", mcpRoot), TerminateDuration: 250 * time.Millisecond}, nil)
+	if err != nil {
+		t.Fatalf("connect MCP: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		if err := session.Close(); err != nil {
+			t.Errorf("close MCP: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- session.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("wait MCP: %v", err)
+			}
+		case <-cleanupCtx.Done():
+			t.Errorf("MCP Close/Wait exceeded deadline: %v", cleanupCtx.Err())
+		}
+	})
+	mcpCall := func(id, operation string, scope, input map[string]any) map[string]any {
+		t.Helper()
+		called, err := session.CallTool(ctx, &gomcp.CallToolParams{Name: operation, Arguments: map[string]any{"contract_version": app.ContractVersion, "operation_id": id, "scope": scope, "input": input}})
+		if err != nil || called.IsError {
+			t.Fatalf("MCP %s = %v/%t", operation, err, called != nil && called.IsError)
+		}
+		response, ok := called.StructuredContent.(map[string]any)
+		if !ok {
+			t.Fatalf("MCP %s response = %T, want map", operation, called.StructuredContent)
+		}
+		return response
+	}
+	compare := func(id, operation string, scope, input map[string]any, want string) (map[string]any, map[string]any) {
+		t.Helper()
+		cli, mcp := cliCall(id, operation, scope, input), mcpCall(id, operation, scope, input)
+		if got, expected := documentSemanticEnvelope(cli), documentSemanticEnvelope(mcp); !reflect.DeepEqual(got, expected) {
+			t.Fatalf("%s parity mismatch\nCLI: %#v\nMCP: %#v", operation, got, expected)
+		}
+		for _, response := range []map[string]any{cli, mcp} {
+			if got := response["outcome"].(map[string]any)["code"]; got != want {
+				t.Fatalf("%s outcome = %q, want %q", operation, got, want)
+			}
+		}
+		return cli, mcp
+	}
+	library := map[string]any{"kind": "library"}
+	project := map[string]any{"kind": "project", "project_id": "project-a"}
+	workstream := map[string]any{"kind": "workstream", "project_id": "project-a", "workstream_id": "workstream-a"}
+	sessionScope := map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-a", "session_id": "session-a"}
+	compare("checkpoint-project", "project.create", library, map[string]any{"project_id": "project-a", "name": "Alpha"}, app.OK)
+	compare("checkpoint-workstream", "workstream.create", project, map[string]any{"workstream_id": "workstream-a", "origin": "parity"}, app.OK)
+	compare("checkpoint-session", "session.open", workstream, map[string]any{"session_id": "session-a", "origin": "parity"}, app.OK)
+	compare("checkpoint-source", "document.create", project, map[string]any{"document_id": "source-a", "revision_id": "source-r1", "expected_revision_id": nil, "content_base64": "AP9zb3VyY2UK", "provenance": map[string]any{"origin": "parity"}}, app.OK)
+	save := map[string]any{"checkpoint_id": "checkpoint-a", "checkpoint_document_id": "checkpoint-document-a", "checkpoint_revision_id": "checkpoint-revision-a", "prose_base64": "AP9oYW5kb2ZmCg", "references": []map[string]any{{"document_id": "source-a", "revision_id": "source-r1"}}, "provenance": map[string]any{"origin": "parity", "client": "sdk", "model": "model-a"}}
+	cliSaved, mcpSaved := compare("checkpoint-save", "checkpoint.save", sessionScope, save, app.OK)
+	for _, response := range []map[string]any{cliSaved, mcpSaved} {
+		result := response["result"].(map[string]any)
+		fresh, present := result["references"].([]any)[0].(map[string]any)["fresh"]
+		if result["prose_base64"] != "AP9oYW5kb2ZmCg" || !present || fresh != true || result["provenance"].(map[string]any)["model"] != "model-a" {
+			t.Fatalf("checkpoint save result = %#v, want exact bytes, explicit fresh:true, and provenance", result)
+		}
+	}
+	compare("checkpoint-read", "checkpoint.read", sessionScope, map[string]any{"checkpoint_id": "checkpoint-a"}, app.OK)
+	compare("checkpoint-missing-session", "checkpoint.read", map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-a", "session_id": "session-missing"}, map[string]any{"checkpoint_id": "checkpoint-a"}, app.NotFound)
+	unrelated := map[string]any{"kind": "workstream", "project_id": "project-a", "workstream_id": "workstream-unrelated"}
+	compare("checkpoint-unrelated-workstream", "workstream.create", project, map[string]any{"workstream_id": "workstream-unrelated", "origin": "parity"}, app.OK)
+	compare("checkpoint-unrelated-document", "document.create", unrelated, map[string]any{"document_id": "unrelated-document", "revision_id": "unrelated-r1", "expected_revision_id": nil, "content_base64": "dW5yZWxhdGVkCg", "provenance": map[string]any{"origin": "parity"}}, app.OK)
+	freshCLI, freshMCP := compare("checkpoint-unrelated-read", "checkpoint.read", sessionScope, map[string]any{"checkpoint_id": "checkpoint-a"}, app.OK)
+	for _, response := range []map[string]any{freshCLI, freshMCP} {
+		fresh, present := response["result"].(map[string]any)["references"].([]any)[0].(map[string]any)["fresh"]
+		if !present || fresh != true {
+			t.Fatalf("unrelated workstream activity did not preserve explicit fresh:true: %#v", response)
+		}
+	}
+	compare("checkpoint-source-advance", "document.update", project, map[string]any{"document_id": "source-a", "revision_id": "source-r2", "expected_revision_id": "source-r1", "content_base64": "dXBkYXRlZAo", "provenance": map[string]any{"origin": "parity"}}, app.OK)
+	staleCLI, staleMCP := compare("checkpoint-stale-read", "checkpoint.read", sessionScope, map[string]any{"checkpoint_id": "checkpoint-a"}, app.OK)
+	for _, response := range []map[string]any{staleCLI, staleMCP} {
+		fresh, present := response["result"].(map[string]any)["references"].([]any)[0].(map[string]any)["fresh"]
+		if !present || fresh != false {
+			t.Fatalf("advanced referenced revision did not return explicit fresh:false: %#v", response)
+		}
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("close MCP before replay: %v", err)
+	}
+	if err := session.Wait(); err != nil {
+		t.Fatalf("wait MCP before replay: %v", err)
+	}
+	session, err = client.Connect(ctx, &gomcp.CommandTransport{Command: exec.CommandContext(ctx, binary, "mcp", "--library", mcpRoot), TerminateDuration: 250 * time.Millisecond}, nil)
+	if err != nil {
+		t.Fatalf("reconnect MCP before replay: %v", err)
+	}
+	replayedCLI, replayedMCP := compare("checkpoint-save", "checkpoint.save", sessionScope, save, app.OK)
+	for index, response := range []map[string]any{replayedCLI, replayedMCP} {
+		original := []map[string]any{cliSaved, mcpSaved}[index]["result"].(map[string]any)
+		replayed := response["result"].(map[string]any)
+		fresh, present := replayed["references"].([]any)[0].(map[string]any)["fresh"]
+		if !present || fresh != false || replayed["checkpoint_id"] != original["checkpoint_id"] || replayed["checkpoint_document_id"] != original["checkpoint_document_id"] || replayed["checkpoint_revision_id"] != original["checkpoint_revision_id"] {
+			t.Fatalf("replayed checkpoint = %#v, want unchanged identity and live explicit fresh:false", replayed)
+		}
+	}
+	compare("checkpoint-save", "checkpoint.save", sessionScope, map[string]any{"checkpoint_id": "checkpoint-a", "checkpoint_document_id": "checkpoint-document-a", "checkpoint_revision_id": "checkpoint-revision-a", "prose_base64": "Y2hhbmdlZA", "references": []map[string]any{{"document_id": "source-a", "revision_id": "source-r1"}}, "provenance": map[string]any{"origin": "parity", "client": "sdk", "model": "model-a"}}, app.IdempotencyMismatch)
+	compare("checkpoint-disconnect", "session.disconnect", sessionScope, map[string]any{"observed_by": "parity"}, app.OK)
+	compare("checkpoint-disconnected-read", "checkpoint.read", sessionScope, map[string]any{"checkpoint_id": "checkpoint-a"}, app.Conflict)
+	compare("checkpoint-resume", "session.resume", workstream, map[string]any{"session_id": "session-b", "source_session_id": "session-a", "origin": "parity"}, app.OK)
+	resumed := map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-a", "session_id": "session-b"}
+	compare("checkpoint-resumed-read", "checkpoint.read", resumed, map[string]any{"checkpoint_id": "checkpoint-a"}, app.OK)
+	compare("checkpoint-fork", "workstream.fork", workstream, map[string]any{"workstream_id": "workstream-fork", "origin": "parity"}, app.OK)
+	fork := map[string]any{"kind": "workstream", "project_id": "project-a", "workstream_id": "workstream-fork"}
+	compare("checkpoint-fork-session", "session.open", fork, map[string]any{"session_id": "session-fork", "origin": "parity"}, app.OK)
+	forkSession := map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-fork", "session_id": "session-fork"}
+	compare("checkpoint-mismatched-binding", "checkpoint.read", map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-fork", "session_id": "session-a"}, map[string]any{"checkpoint_id": "checkpoint-a"}, app.BindingMismatch)
+	compare("checkpoint-fork-read", "checkpoint.read", forkSession, map[string]any{"checkpoint_id": "checkpoint-a"}, app.ScopeDenied)
+	large := base64.RawStdEncoding.EncodeToString(make([]byte, 64<<10))
+	compare("checkpoint-limit", "checkpoint.save", resumed, map[string]any{"checkpoint_id": "checkpoint-limit", "checkpoint_document_id": "checkpoint-document-limit", "checkpoint_revision_id": "checkpoint-revision-limit", "prose_base64": large, "references": []map[string]any{{"document_id": "source-a", "revision_id": "source-r2"}}, "provenance": map[string]any{"origin": "parity"}}, app.OK)
+	for _, root := range []string{cliRoot, mcpRoot} {
+		path := filepath.Join(root, "projects", "project-a", "documents", "checkpoint-document-a", "revisions", "checkpoint-revision-a.md")
+		if err := os.WriteFile(path, []byte("tampered"), 0o600); err != nil {
+			t.Fatalf("tamper checkpoint backing prose: %v", err)
+		}
+	}
+	compare("checkpoint-tampered-read", "checkpoint.read", resumed, map[string]any{"checkpoint_id": "checkpoint-a"}, app.IntegrityDiscrepancy)
 }
 
 func TestCommandTransportReapsUnresponsiveChild(t *testing.T) {

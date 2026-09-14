@@ -61,8 +61,8 @@ func TestCheckpointStoreComputesFreshnessAndPreservesDisconnectedSourceAcrossRes
 	if outcome, _, err := store.WriteDocument(t.Context(), files, "source-update", "source-document-a", "project-a", "", "source-revision-b", stringPointer("source-revision-a"), []byte("# updated\n"), "cli", "", "", time.Now()); err != nil || outcome != app.OK {
 		t.Fatalf("WriteDocument(source update) = %q, %v", outcome, err)
 	}
-	if raw, err := store.ReadCheckpoint(t.Context(), files, "project-a", "workstream-a", "session-b", "checkpoint-a"); err != nil || checkpointReferenceFresh(t, raw) {
-		t.Fatalf("ReadCheckpoint(stale exact source) = %s, %v; want stale only after its pointer advances", raw, err)
+	if raw, err := store.ReadCheckpoint(t.Context(), files, "project-a", "workstream-a", "session-b", "checkpoint-a"); err != nil || checkpointReferenceFresh(t, raw) || !checkpointReferenceHasFreshKey(t, raw) {
+		t.Fatalf("ReadCheckpoint(stale exact source) = %s, %v; want explicit fresh:false only after its pointer advances", raw, err)
 	}
 	if err := store.ForkWorkstream(t.Context(), "project-a", "workstream-a", "workstream-fork", "cli", "", "", time.Now()); err != nil {
 		t.Fatalf("ForkWorkstream() error = %v", err)
@@ -72,6 +72,16 @@ func TestCheckpointStoreComputesFreshnessAndPreservesDisconnectedSourceAcrossRes
 	}
 	if _, err := store.ReadCheckpoint(t.Context(), files, "project-a", "workstream-fork", "session-fork", "checkpoint-a"); !checkpointHasCode(err, "scope_denied") {
 		t.Fatalf("ReadCheckpoint(fork) error = %v, want scope_denied", err)
+	}
+}
+
+func TestCheckpointDigestPreservesFrozenPreChangeRequestFixture(t *testing.T) {
+	references := []checkpointReference{{DocumentID: "source-document-a", RevisionID: "source-revision-a"}}
+	got := checkpointDigest("checkpoint-operation-a", "checkpoint-a", "checkpoint-document-a", "checkpoint-revision-a", "project-a", "workstream-a", "session-a", []byte("# handoff\n"), references, "cli", "terminal", "reported")
+	// Frozen from the committed request fixture at dc8de02 before response-only freshness serialization changed.
+	const want = "91955649763d7a8ad045338eb42bbe2eb951d3119c809fe22eecdbb4b72d5a29"
+	if got != want {
+		t.Fatalf("checkpointDigest() = %q, want frozen pre-change fixture %q", got, want)
 	}
 }
 
@@ -285,6 +295,18 @@ func checkpointReferenceFresh(t *testing.T, raw []byte) bool {
 		t.Fatalf("checkpoint freshness response = %s, %v", raw, err)
 	}
 	return value.References[0].Fresh
+}
+
+func checkpointReferenceHasFreshKey(t *testing.T, raw []byte) bool {
+	t.Helper()
+	var value struct {
+		References []map[string]json.RawMessage `json:"references"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil || len(value.References) != 1 {
+		t.Fatalf("checkpoint freshness-key response = %s, %v", raw, err)
+	}
+	_, found := value.References[0]["fresh"]
+	return found
 }
 
 func checkpointDatabasePath(t *testing.T, store *Store) string {

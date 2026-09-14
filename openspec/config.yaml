@@ -1,0 +1,51 @@
+schema: spec-driven
+
+context: |
+  MemGraph AI is a local, agent-first project knowledge system defined by docs/PROJECT.md revision 0.4.1.
+  Treat docs/PROJECT.md as the settled product source; preserve its confirmed, proposed, and open-decision labels.
+  The product is implemented as one Go executable for macOS with shared CLI and MCP application services.
+  SQLite owns operational state, Markdown owns document prose, and core retrieval must work without embeddings.
+  Phase 0 is complete. Phase 1 tasks P1.1–P1.5 are implemented; P1.6 remains pending and must not be treated as complete without its required evidence.
+  The repository has Go source implementation and a verified runtime/test runner.
+
+workflow:
+  execution_mode: auto
+  artifact_store: openspec
+  delivery_strategy: ask-on-risk
+  review_budget_changed_lines: 2000
+  chain_strategy: deferred
+
+implementation_status:
+  phase0: complete
+  phase1:
+    implemented: "P1.1–P1.5"
+    pending: "P1.6"
+  verified_runner:
+    command: "go test ./..."
+    result: "passed on go1.27.0 darwin/arm64"
+    selected_sqlite_module: "modernc.org/sqlite v1.58.0"
+
+rules:
+  proposal:
+    - Keep work within roadmap phases 0 and 1 unless the user expands scope.
+    - Preserve confirmed invariants and surface relevant open decisions without reopening product review.
+  specs:
+    - Define observable behavior and CLI/MCP parity without inventing unapproved APIs or performance targets.
+    - Keep session scope, authorization, provenance, concurrency, recovery, and revision behavior explicit.
+  design:
+    - Prefer concrete shared Go application services and portable boundaries over premature abstractions.
+    - Record crash windows, idempotency, bounded contention, and SQLite/Markdown authority boundaries.
+  tasks:
+    - Plan behavioral work in strict TDD order and include verification evidence.
+    - Keep implementation tasks reviewable within the 2000 changed-line budget; ask when risk requires a delivery decision.
+  apply:
+    - Require explicit user approval before implementation.
+    - Use strict RED -> GREEN -> TRIANGULATE -> REFACTOR for every behavioral change.
+    - Do not install dependencies, publish, commit, or run paid/live integrations without applicable approval.
+
+strict_tdd: true
+
+testing:
+  runner_availability: verified
+  proposed_go_command: go test ./...
+  note: The Go runner is verified on go1.27.0 darwin/arm64; use observed Go evidence and keep P1.6 pending until its required verification evidence is recorded.

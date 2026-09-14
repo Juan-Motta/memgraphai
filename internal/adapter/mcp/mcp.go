@@ -25,11 +25,11 @@ type ToolInput struct {
 }
 
 // NewServer constructs the exact project, continuity, and document operation tools.
-func NewServer(projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, recorder app.Service) *gomcp.Server {
-	return newServer(projects, continuity, documents, recorder, nil)
+func NewServer(projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, recorder app.Service, checkpoints ...app.CheckpointService) *gomcp.Server {
+	return newServer(projects, continuity, documents, recorder, nil, checkpoints...)
 }
 
-func newServer(projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, recorder app.Service, wire *wireMetricWriter) *gomcp.Server {
+func newServer(projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, recorder app.Service, wire *wireMetricWriter, checkpoints ...app.CheckpointService) *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "memgraphai", Version: "v1alpha1"}, nil)
 	for _, operation := range []string{
 		"project.create", "project.list", "project.resolve",
@@ -45,6 +45,11 @@ func newServer(projects app.ProjectService, continuity app.ContinuityService, do
 	}
 	for _, operation := range []string{"document.create", "document.update", "document.list", "document.read", "document.history"} {
 		addTool(server, operation, documents.Handle, recorder, wire)
+	}
+	if len(checkpoints) == 1 && checkpoints[0].Store != nil && checkpoints[0].Files != nil {
+		for _, operation := range []string{"checkpoint.save", "checkpoint.read"} {
+			addTool(server, operation, checkpoints[0].Handle, recorder, wire)
+		}
 	}
 	return server
 }
@@ -78,14 +83,14 @@ func addTool(server *gomcp.Server, operation string, handler app.Handler, execut
 }
 
 // RunStdio serves one client-owned MCP stdio connection until EOF.
-func RunStdio(ctx context.Context, projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, executor app.Service) error {
-	return RunIO(ctx, projects, continuity, documents, executor, os.Stdin, os.Stdout)
+func RunStdio(ctx context.Context, projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, executor app.Service, checkpoints ...app.CheckpointService) error {
+	return RunIO(ctx, projects, continuity, documents, executor, os.Stdin, os.Stdout, checkpoints...)
 }
 
 // RunIO permits tests and the executable to use the SDK's newline-delimited stdio framing.
-func RunIO(ctx context.Context, projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, executor app.Service, reader io.ReadCloser, writer io.WriteCloser) error {
+func RunIO(ctx context.Context, projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, executor app.Service, reader io.ReadCloser, writer io.WriteCloser, checkpoints ...app.CheckpointService) error {
 	wire := &wireMetricWriter{WriteCloser: writer, recorder: executor.Recorder, pending: make(map[string]pendingMetric)}
-	return newServer(projects, continuity, documents, executor, wire).Run(ctx, &gomcp.IOTransport{Reader: reader, Writer: wire})
+	return newServer(projects, continuity, documents, executor, wire, checkpoints...).Run(ctx, &gomcp.IOTransport{Reader: reader, Writer: wire})
 }
 
 type wireMetricWriter struct {
