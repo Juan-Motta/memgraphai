@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"memgraphai/internal/app"
+	"memgraphai/internal/revisionfs"
 	"memgraphai/internal/store/sqlite"
 	"memgraphai/internal/telemetry"
 )
@@ -53,9 +54,15 @@ func Run(ctx context.Context, args []string, in io.Reader, out io.Writer, errOut
 	}
 	projects := app.ProjectService{Store: store}
 	continuity := app.ContinuityService{Store: store}
+	documents := app.DocumentService{Store: store, Files: revisionfs.New(root, nil)}
 	handler := projects.Handle
-	if request, code := app.ParseRequest(raw); code == "" && (strings.HasPrefix(request.Operation, "workstream.") || strings.HasPrefix(request.Operation, "session.")) {
-		handler = continuity.Handle
+	if request, code := app.ParseRequest(raw); code == "" {
+		switch {
+		case strings.HasPrefix(request.Operation, "workstream."), strings.HasPrefix(request.Operation, "session."):
+			handler = continuity.Handle
+		case strings.HasPrefix(request.Operation, "document."):
+			handler = documents.Handle
+		}
 	}
 	started := time.Now()
 	serialized, response := (app.Service{}).ExecuteJSON(ctx, raw, "cli", handler)
@@ -108,6 +115,9 @@ func commandRequest(operationID string, args []string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if strings.HasPrefix(operation, "document.") {
+		return documentCommandRequest(operationID, operation, args)
+	}
 	scope := app.Scope{Kind: "library"}
 	input := map[string]string{}
 	var page *app.Page
@@ -149,11 +159,59 @@ func commandOperation(args []string) (string, []string, error) {
 			return "project.association." + args[2], args[3:], nil
 		}
 		return "project." + args[1], args[2:], nil
-	case "workstream", "session":
+	case "workstream", "session", "document":
 		return args[0] + "." + args[1], args[2:], nil
 	default:
 		return "", nil, errors.New("unknown command")
 	}
+}
+
+func documentCommandRequest(operationID, operation string, args []string) ([]byte, error) {
+	scope := app.Scope{Kind: "project"}
+	input := map[string]any{}
+	provenance := map[string]string{}
+	var page *app.Page
+	for len(args) > 0 {
+		if len(args) < 2 || !strings.HasPrefix(args[0], "--") {
+			return nil, errors.New("invalid document argument")
+		}
+		key, value := strings.TrimPrefix(args[0], "--"), args[1]
+		switch key {
+		case "project-id":
+			scope.ProjectID = value
+		case "workstream-id":
+			scope.Kind, scope.WorkstreamID = "workstream", value
+		case "document-id", "revision-id", "content-base64":
+			input[strings.ReplaceAll(key, "-", "_")] = value
+		case "expected-revision-id":
+			if value == "null" {
+				input["expected_revision_id"] = nil
+			} else {
+				input["expected_revision_id"] = value
+			}
+		case "provenance-origin", "provenance-client", "provenance-model":
+			provenance[strings.TrimPrefix(key, "provenance-")] = value
+		case "limit":
+			limit, err := strconv.Atoi(value)
+			if err != nil {
+				return nil, errors.New("invalid document limit")
+			}
+			page = &app.Page{Limit: &limit}
+		case "token":
+			if page == nil {
+				page = &app.Page{}
+			}
+			page.Token = value
+		default:
+			return nil, errors.New("invalid document argument")
+		}
+		args = args[2:]
+	}
+	if len(provenance) > 0 {
+		input["provenance"] = provenance
+	}
+	inputJSON, _ := json.Marshal(input)
+	return json.Marshal(app.Request{ContractVersion: app.ContractVersion, OperationID: operationID, Operation: operation, Scope: scope, Input: inputJSON, Page: page})
 }
 
 func setContinuityScope(scope *app.Scope, operation, key, value string, input map[string]string) {

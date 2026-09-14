@@ -3,8 +3,10 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -17,6 +19,7 @@ import (
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"memgraphai/internal/app"
+	"memgraphai/internal/revisionfs"
 	"memgraphai/internal/store/sqlite"
 )
 
@@ -40,8 +43,8 @@ func TestStdioServerListsAndCallsProjectTool(t *testing.T) {
 		_ = session.Wait()
 	})
 	tools, err := session.ListTools(t.Context(), nil)
-	if err != nil || len(tools.Tools) != 14 {
-		t.Fatalf("ListTools() = %d, %v; want fourteen project and continuity tools", len(tools.Tools), err)
+	if err != nil || len(tools.Tools) != 19 {
+		t.Fatalf("ListTools() = %d, %v; want nineteen project, continuity, and document tools", len(tools.Tools), err)
 	}
 	path := filepath.Join(t.TempDir(), "associated")
 	if err := os.Mkdir(path, 0o755); err != nil {
@@ -181,8 +184,8 @@ func TestStdioServerListsAndCallsContinuityTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools() error = %v", err)
 	}
-	if len(tools.Tools) != 14 {
-		t.Fatalf("ListTools() = %d tools, want 14 project and continuity tools", len(tools.Tools))
+	if len(tools.Tools) != 19 {
+		t.Fatalf("ListTools() = %d tools, want 19 project, continuity, and document tools", len(tools.Tools))
 	}
 	call := func(name, id string, scope, input map[string]any) map[string]any {
 		t.Helper()
@@ -400,54 +403,150 @@ func TestContinuityMCPEOFLeavesSessionsUnchangedAndDisconnectIsScoped(t *testing
 	}
 }
 
-func TestMCPMetricEqualsIndependentlyCapturedJSONRPCFrame(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+func TestStdioServerExposesDocumentToolsAndExactBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	storePath := filepath.Join(t.TempDir(), "database.sqlite")
-	store, err := sqlite.Open(ctx, storePath)
+	binary := filepath.Join(t.TempDir(), "memgraphai")
+	if output, err := exec.Command("go", "build", "-o", binary, "../../../cmd/memgraphai").CombinedOutput(); err != nil {
+		t.Fatalf("build server: %v\n%s", err, output)
+	}
+	library := t.TempDir()
+	client := gomcp.NewClient(&gomcp.Implementation{Name: "documents-test", Version: "v1alpha1"}, nil)
+	session, err := client.Connect(ctx, &gomcp.CommandTransport{Command: exec.CommandContext(ctx, binary, "mcp", "--library", library), TerminateDuration: 250 * time.Millisecond}, nil)
 	if err != nil {
-		t.Fatalf("open store: %v", err)
+		t.Fatalf("connect MCP: %v", err)
 	}
-	serverIn, clientOut := io.Pipe()
-	clientIn, serverOut := io.Pipe()
-	capture := &frameCapture{WriteCloser: serverOut}
-	serverDone := make(chan error, 1)
-	go func() {
-		serverDone <- RunIO(ctx, app.ProjectService{Store: store}, app.ContinuityService{Store: store}, app.Service{Recorder: store}, serverIn, capture)
-	}()
-	client := gomcp.NewClient(&gomcp.Implementation{Name: "wire-test", Version: "v1alpha1"}, nil)
-	session, err := client.Connect(ctx, &gomcp.IOTransport{Reader: clientIn, Writer: clientOut}, nil)
+	t.Cleanup(func() {
+		_ = session.Close()
+		_ = session.Wait()
+	})
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil || len(tools.Tools) != 19 {
+		t.Fatalf("ListTools() = %d, %v; want nineteen project, continuity, and document tools", len(tools.Tools), err)
+	}
+	call := func(name, id string, scope, input map[string]any) map[string]any {
+		t.Helper()
+		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		called, err := session.CallTool(callCtx, &gomcp.CallToolParams{Name: name, Arguments: map[string]any{"contract_version": app.ContractVersion, "operation_id": id, "scope": scope, "input": input}})
+		if err != nil || called.IsError {
+			t.Fatalf("CallTool(%s) = %v/%t", name, err, called != nil && called.IsError)
+		}
+		return called.StructuredContent.(map[string]any)
+	}
+	libraryScope := map[string]any{"kind": "library"}
+	projectScope := map[string]any{"kind": "project", "project_id": "project-a"}
+	workstreamScope := map[string]any{"kind": "workstream", "project_id": "project-a", "workstream_id": "stream-a"}
+	call("project.create", "mcp-document-project", libraryScope, map[string]any{"project_id": "project-a", "name": "Alpha"})
+	call("workstream.create", "mcp-document-stream", projectScope, map[string]any{"workstream_id": "stream-a", "origin": "mcp"})
+	content := "AP9NYXJrZG93bgo"
+	created := call("document.create", "mcp-document-create", projectScope, map[string]any{"document_id": "document-a", "revision_id": "revision-1", "expected_revision_id": nil, "content_base64": content, "provenance": map[string]any{"origin": "mcp", "client": "sdk", "model": "model-a"}})
+	if got := created["result"].(map[string]any)["provenance"].(map[string]any)["model"]; got != "model-a" {
+		t.Fatalf("create provenance model = %q, want model-a", got)
+	}
+	call("document.update", "mcp-document-update", projectScope, map[string]any{"document_id": "document-a", "revision_id": "revision-2", "expected_revision_id": "revision-1", "content_base64": content, "provenance": map[string]any{"origin": "mcp"}})
+	listed := call("document.list", "mcp-document-list", projectScope, map[string]any{})
+	if len(listed["result"].(map[string]any)["documents"].([]any)) != 1 {
+		t.Fatalf("document list = %#v, want one project-general document", listed)
+	}
+	read := call("document.read", "mcp-document-read", projectScope, map[string]any{"document_id": "document-a", "revision_id": "revision-2"})
+	if got := read["result"].(map[string]any)["content_base64"]; got != content {
+		t.Fatalf("MCP read base64 = %q, want exact original %q", got, content)
+	}
+	history := call("document.history", "mcp-document-history", projectScope, map[string]any{"document_id": "document-a"})
+	if len(history["result"].(map[string]any)["revisions"].([]any)) != 2 {
+		t.Fatalf("document history = %#v, want two exact revisions", history)
+	}
+	wrongScope := call("document.read", "mcp-document-wrong-scope", workstreamScope, map[string]any{"document_id": "document-a"})
+	if got := wrongScope["outcome"].(map[string]any)["code"]; got != app.ScopeDenied {
+		t.Fatalf("workstream read of project-general document = %q, want %q", got, app.ScopeDenied)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("close first MCP connection: %v", err)
+	}
+	if err := session.Wait(); err != nil {
+		t.Fatalf("wait first MCP connection: %v", err)
+	}
+	reconnected, err := client.Connect(ctx, &gomcp.CommandTransport{Command: exec.CommandContext(ctx, binary, "mcp", "--library", library), TerminateDuration: 250 * time.Millisecond}, nil)
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("reconnect MCP: %v", err)
 	}
-	_, err = session.CallTool(ctx, &gomcp.CallToolParams{Name: "project.create", Arguments: map[string]any{
-		"contract_version": app.ContractVersion, "operation_id": "wire-exact", "scope": map[string]any{"kind": "library"},
-		"input": map[string]any{"project_id": "project-wire", "name": "Wire"},
-	}})
-	if err != nil {
-		t.Fatalf("CallTool: %v", err)
+	t.Cleanup(func() {
+		_ = reconnected.Close()
+		_ = reconnected.Wait()
+	})
+	replayed, err := reconnected.CallTool(ctx, &gomcp.CallToolParams{Name: "document.create", Arguments: map[string]any{"contract_version": app.ContractVersion, "operation_id": "mcp-document-create", "scope": projectScope, "input": map[string]any{"document_id": "document-a", "revision_id": "revision-1", "expected_revision_id": nil, "content_base64": content, "provenance": map[string]any{"origin": "mcp", "client": "sdk", "model": "model-a"}}}})
+	if err != nil || replayed.IsError || replayed.StructuredContent.(map[string]any)["result"].(map[string]any)["revision_id"] != "revision-1" {
+		t.Fatalf("reconnected identical replay = %v/%#v, want stored durable revision", err, replayed)
 	}
-	frame := capture.frameContaining("wire-exact")
-	_ = session.Close()
-	select {
-	case <-serverDone:
-	case <-ctx.Done():
-		t.Fatalf("server shutdown exceeded deadline: %v", ctx.Err())
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-	db, err := sql.Open("sqlite", storePath)
-	if err != nil {
-		t.Fatalf("open metric database: %v", err)
-	}
-	defer db.Close()
-	var recorded int
-	if err := db.QueryRowContext(ctx, "SELECT response_bytes FROM operation_metrics WHERE operation_id = 'wire-exact'").Scan(&recorded); err != nil {
-		t.Fatalf("read metric: %v", err)
-	}
-	if recorded != len(frame) {
-		t.Fatalf("response_bytes = %d, captured frame bytes = %d; want exact equality", recorded, len(frame))
+}
+
+func TestMCPMetricEqualsIndependentlyCapturedJSONRPCFrame(t *testing.T) {
+	for _, test := range []struct {
+		name, operationID, operation string
+		scope, input                 map[string]any
+		setup                        func(context.Context, *gomcp.ClientSession)
+	}{
+		{"project", "wire-project", "project.create", map[string]any{"kind": "library"}, map[string]any{"project_id": "project-wire", "name": "Wire"}, nil},
+		{"document", "wire-document", "document.create", map[string]any{"kind": "project", "project_id": "project-wire"}, map[string]any{"document_id": "document-wire", "revision_id": "revision-wire", "expected_revision_id": nil, "content_base64": "d2lyZQ", "provenance": map[string]any{"origin": "wire"}}, func(ctx context.Context, session *gomcp.ClientSession) {
+			_, err := session.CallTool(ctx, &gomcp.CallToolParams{Name: "project.create", Arguments: map[string]any{"contract_version": app.ContractVersion, "operation_id": "fixture-project", "scope": map[string]any{"kind": "library"}, "input": map[string]any{"project_id": "project-wire", "name": "Wire"}}})
+			if err != nil {
+				t.Fatalf("document fixture project: %v", err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			storePath := filepath.Join(t.TempDir(), "database.sqlite")
+			store, err := sqlite.Open(ctx, storePath)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			serverIn, clientOut := io.Pipe()
+			clientIn, serverOut := io.Pipe()
+			capture := &frameCapture{WriteCloser: serverOut}
+			serverDone := make(chan error, 1)
+			go func() {
+				serverDone <- RunIO(ctx, app.ProjectService{Store: store}, app.ContinuityService{Store: store}, app.DocumentService{Store: store, Files: revisionfs.New(filepath.Dir(storePath), nil)}, app.Service{Recorder: store}, serverIn, capture)
+			}()
+			session, err := gomcp.NewClient(&gomcp.Implementation{Name: "wire-test", Version: "v1alpha1"}, nil).Connect(ctx, &gomcp.IOTransport{Reader: clientIn, Writer: clientOut}, nil)
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			if test.setup != nil {
+				test.setup(ctx, session)
+			}
+			_, err = session.CallTool(ctx, &gomcp.CallToolParams{Name: test.operation, Arguments: map[string]any{"contract_version": app.ContractVersion, "operation_id": test.operationID, "scope": test.scope, "input": test.input}})
+			if err != nil {
+				t.Fatalf("CallTool(%s): %v", test.operation, err)
+			}
+			_ = session.Close()
+			select {
+			case <-serverDone:
+			case <-ctx.Done():
+				t.Fatalf("server shutdown exceeded deadline: %v", ctx.Err())
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+			db, err := sql.Open("sqlite", storePath)
+			if err != nil {
+				t.Fatalf("open metric database: %v", err)
+			}
+			defer db.Close()
+			frame := capture.frameContaining(test.operationID)
+			var recorded int
+			if len(frame) == 0 {
+				t.Fatalf("captured JSON-RPC frame for %q is empty", test.operationID)
+			}
+			if err := db.QueryRowContext(ctx, "SELECT response_bytes FROM operation_metrics WHERE operation_id = ?", test.operationID).Scan(&recorded); err != nil {
+				t.Fatalf("read %s metric: %v", test.operationID, err)
+			}
+			if recorded != len(frame) {
+				t.Fatalf("%s response_bytes = %d, captured frame bytes = %d; want exact equality", test.operationID, recorded, len(frame))
+			}
+		})
 	}
 }
 
@@ -473,6 +572,246 @@ func (c *frameCapture) frameContaining(operationID string) []byte {
 		}
 	}
 	return nil
+}
+
+func TestDocumentAdaptersHaveEquivalentSemanticEnvelopes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	binary := filepath.Join(t.TempDir(), "memgraphai")
+	if output, err := exec.Command("go", "build", "-o", binary, "../../../cmd/memgraphai").CombinedOutput(); err != nil {
+		t.Fatalf("build binary: %v\n%s", err, output)
+	}
+	cliRoot, mcpRoot := t.TempDir(), t.TempDir()
+	client := gomcp.NewClient(&gomcp.Implementation{Name: "documents-parity", Version: "v1alpha1"}, nil)
+	mcpSession, err := client.Connect(ctx, &gomcp.CommandTransport{Command: exec.CommandContext(ctx, binary, "mcp", "--library", mcpRoot), TerminateDuration: 250 * time.Millisecond}, nil)
+	if err != nil {
+		t.Fatalf("connect MCP: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+		if err := mcpSession.Close(); err != nil {
+			t.Errorf("close MCP: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- mcpSession.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("wait MCP: %v", err)
+			}
+		case <-cleanupCtx.Done():
+			t.Errorf("MCP Close/Wait exceeded deadline: %v", cleanupCtx.Err())
+		}
+	})
+	invokeCLI := func(operation, id string, scope, input map[string]any, page map[string]any) map[string]any {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]any{"contract_version": app.ContractVersion, "operation_id": id, "operation": operation, "scope": scope, "input": input, "page": page})
+		command := exec.CommandContext(ctx, binary, "--library", cliRoot, "--json")
+		command.Stdin = bytes.NewReader(raw)
+		output, _ := command.CombinedOutput()
+		var response map[string]any
+		if err := json.Unmarshal(output, &response); err != nil {
+			t.Fatalf("decode CLI %s response %q: %v", operation, output, err)
+		}
+		return response
+	}
+	invokeMCP := func(operation, id string, scope, input map[string]any, page map[string]any) map[string]any {
+		t.Helper()
+		called, err := mcpSession.CallTool(ctx, &gomcp.CallToolParams{Name: operation, Arguments: map[string]any{"contract_version": app.ContractVersion, "operation_id": id, "scope": scope, "input": input, "page": page}})
+		if err != nil || called.IsError {
+			t.Fatalf("MCP %s = %v/%t", operation, err, called != nil && called.IsError)
+		}
+		response, ok := called.StructuredContent.(map[string]any)
+		if !ok {
+			t.Fatalf("MCP %s response = %T, want map", operation, called.StructuredContent)
+		}
+		return response
+	}
+	compare := func(name, operation, id string, scope, input, page map[string]any) (map[string]any, map[string]any) {
+		t.Helper()
+		cli, mcp := invokeCLI(operation, id, scope, input, page), invokeMCP(operation, id, scope, input, page)
+		if got, want := documentSemanticEnvelope(cli), documentSemanticEnvelope(mcp); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s semantic envelope mismatch\nCLI: %#v\nMCP: %#v", name, got, want)
+		}
+		return cli, mcp
+	}
+	library := map[string]any{"kind": "library"}
+	project := map[string]any{"kind": "project", "project_id": "project-a"}
+	workstream := map[string]any{"kind": "workstream", "project_id": "project-a", "workstream_id": "stream-a"}
+	content := "AP9NYXJrZG93bgo"
+	write := func(document, revision, expected, origin string) map[string]any {
+		return map[string]any{"document_id": document, "revision_id": revision, "expected_revision_id": expected, "content_base64": content, "provenance": map[string]any{"origin": origin, "client": "parity", "model": "model-a"}}
+	}
+	writeNull := func(document, revision, origin string) map[string]any {
+		value := write(document, revision, "", origin)
+		value["expected_revision_id"] = nil
+		return value
+	}
+	for _, test := range []struct {
+		name, operation, id string
+		scope, input, page  map[string]any
+	}{
+		{"project", "project.create", "parity-project", library, map[string]any{"project_id": "project-a", "name": "Alpha"}, nil},
+		{"workstream", "workstream.create", "parity-workstream", project, map[string]any{"workstream_id": "stream-a", "origin": "parity"}, nil},
+		{"project document", "document.create", "parity-project-create", project, writeNull("project-doc", "project-r1", "cli"), nil},
+		{"workstream document", "document.create", "parity-workstream-create", workstream, writeNull("workstream-doc", "stream-r1", "mcp"), nil},
+		{"foreign document", "document.create", "parity-foreign-create", project, writeNull("foreign-doc", "foreign-r1", "cli"), nil},
+		{"project update", "document.update", "parity-project-update", project, write("project-doc", "project-r2", "project-r1", "cli"), nil},
+	} {
+		t.Run(test.name, func(t *testing.T) { compare(test.name, test.operation, test.id, test.scope, test.input, test.page) })
+	}
+	createdCLI, createdMCP := compare("identical create replay", "document.create", "parity-project-create", project, writeNull("project-doc", "project-r1", "cli"), nil)
+	for _, response := range []map[string]any{createdCLI, createdMCP} {
+		result := response["result"].(map[string]any)
+		checksum := sha256.Sum256([]byte{0, 0xff, 'M', 'a', 'r', 'k', 'd', 'o', 'w', 'n', '\n'})
+		if result["checksum"] != fmt.Sprintf("%x", checksum) || result["byte_count"] != float64(11) || result["provenance"].(map[string]any)["model"] != "model-a" {
+			t.Fatalf("create metadata = %#v, want exact checksum, byte count, and provenance", result)
+		}
+	}
+	matrix := []struct {
+		name, operation, id string
+		scope, input, page  map[string]any
+		want                string
+	}{
+		{"project-general excludes workstream", "document.list", "parity-project-list", project, map[string]any{}, nil, app.OK},
+		{"workstream excludes project-general", "document.list", "parity-workstream-list", workstream, map[string]any{}, nil, app.OK},
+		{"foreign historical revision binding", "document.read", "parity-foreign-history", project, map[string]any{"document_id": "project-doc", "revision_id": "foreign-r1"}, nil, app.BindingMismatch},
+		{"wrong-scope read", "document.read", "parity-wrong-scope-read", workstream, map[string]any{"document_id": "project-doc"}, nil, app.ScopeDenied},
+		{"stale update preserves current", "document.update", "parity-stale", project, write("project-doc", "project-r3", "project-r1", "cli"), nil, app.Conflict},
+		{"changed immutable replay mismatch", "document.create", "parity-project-create", project, writeNull("project-doc", "project-r1", "changed"), nil, app.IdempotencyMismatch},
+		{"zero list limit", "document.list", "parity-limit-zero", project, map[string]any{}, map[string]any{"limit": 0}, app.Invalid},
+		{"negative list limit", "document.list", "parity-limit-negative", project, map[string]any{}, map[string]any{"limit": -1}, app.Invalid},
+		{"over-max list limit", "document.list", "parity-limit-over", project, map[string]any{}, map[string]any{"limit": 201}, app.Invalid},
+		{"zero history limit", "document.history", "parity-history-limit-zero", project, map[string]any{"document_id": "project-doc"}, map[string]any{"limit": 0}, app.Invalid},
+		{"negative history limit", "document.history", "parity-history-limit-negative", project, map[string]any{"document_id": "project-doc"}, map[string]any{"limit": -1}, app.Invalid},
+		{"over-max history limit", "document.history", "parity-history-limit-over", project, map[string]any{"document_id": "project-doc"}, map[string]any{"limit": 201}, app.Invalid},
+	}
+	for _, test := range matrix {
+		t.Run(test.name, func(t *testing.T) {
+			cli, mcp := compare(test.name, test.operation, test.id, test.scope, test.input, test.page)
+			for _, response := range []map[string]any{cli, mcp} {
+				if got := response["outcome"].(map[string]any)["code"]; got != test.want {
+					t.Fatalf("%s outcome = %q, want %q", test.name, got, test.want)
+				}
+			}
+		})
+	}
+	projectListCLI, projectListMCP := compare("project-general default list", "document.list", "parity-project-default", project, map[string]any{}, nil)
+	for _, response := range []map[string]any{projectListCLI, projectListMCP} {
+		for _, item := range response["result"].(map[string]any)["documents"].([]any) {
+			if _, found := item.(map[string]any)["workstream_id"]; found {
+				t.Fatalf("project-general list widened into a workstream: %#v", response)
+			}
+		}
+	}
+	workstreamListCLI, workstreamListMCP := compare("workstream default list", "document.list", "parity-workstream-default", workstream, map[string]any{}, nil)
+	for _, response := range []map[string]any{workstreamListCLI, workstreamListMCP} {
+		documents := response["result"].(map[string]any)["documents"].([]any)
+		if len(documents) != 1 || documents[0].(map[string]any)["document_id"] != "workstream-doc" {
+			t.Fatalf("workstream list = %#v, want only its explicit document", response)
+		}
+	}
+	currentCLI, currentMCP := compare("current remains revision two", "document.read", "parity-current", project, map[string]any{"document_id": "project-doc"}, nil)
+	for _, response := range []map[string]any{currentCLI, currentMCP} {
+		result := response["result"].(map[string]any)
+		if result["revision_id"] != "project-r2" || result["content_base64"] != content {
+			t.Fatalf("current after stale update = %#v, want revision two exact bytes", result)
+		}
+	}
+	historicalCLI, historicalMCP := compare("historical exact byte parity", "document.read", "parity-historical-exact", project, map[string]any{"document_id": "project-doc", "revision_id": "project-r1"}, nil)
+	for _, response := range []map[string]any{historicalCLI, historicalMCP} {
+		result := response["result"].(map[string]any)
+		if result["revision_id"] != "project-r1" || result["content_base64"] != content {
+			t.Fatalf("historical read = %#v, want revision one exact bytes", result)
+		}
+	}
+	listCLI, listMCP := compare("list continuation source", "document.list", "parity-list-page", project, map[string]any{}, map[string]any{"limit": 1})
+	historyCLI, historyMCP := compare("history continuation source", "document.history", "parity-history-page", project, map[string]any{"document_id": "project-doc"}, map[string]any{"limit": 1})
+	for _, pair := range [][3]any{{listCLI, listMCP, "document.list"}, {historyCLI, historyMCP, "document.history"}} {
+		cli, mcp, operation := pair[0].(map[string]any), pair[1].(map[string]any), pair[2].(string)
+		cliToken := cli["page"].(map[string]any)["next_token"].(string)
+		mcpToken := mcp["page"].(map[string]any)["next_token"].(string)
+		if cliToken == "" || mcpToken == "" {
+			t.Fatalf("%s continuation token missing", operation)
+		}
+		input := map[string]any{}
+		if operation == "document.history" {
+			input["document_id"] = "project-doc"
+		}
+		cliFollow := invokeCLI(operation, "parity-"+operation+"-next", project, input, map[string]any{"limit": 1, "token": cliToken})
+		mcpFollow := invokeMCP(operation, "parity-"+operation+"-next", project, input, map[string]any{"limit": 1, "token": mcpToken})
+		if got, want := documentSemanticEnvelope(cliFollow), documentSemanticEnvelope(mcpFollow); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s own-token semantic mismatch\nCLI: %#v\nMCP: %#v", operation, got, want)
+		}
+		if got := mcpFollow["outcome"].(map[string]any)["code"]; got != app.OK {
+			t.Fatalf("MCP %s own token outcome = %q, want ok", operation, got)
+		}
+		reboundInput := map[string]any{}
+		if operation == "document.history" {
+			reboundInput["document_id"] = "project-doc"
+		}
+		for _, response := range []map[string]any{invokeCLI(operation, "parity-rebound-cli", workstream, reboundInput, map[string]any{"limit": 1, "token": cliToken}), invokeMCP(operation, "parity-rebound-mcp", workstream, reboundInput, map[string]any{"limit": 1, "token": mcpToken})} {
+			if got := response["outcome"].(map[string]any)["code"]; got != app.Invalid {
+				t.Fatalf("%s rebound token outcome = %q, want invalid", operation, got)
+			}
+		}
+	}
+	compare("freshness document create", "document.create", "parity-freshness-create", project, writeNull("project-doc-2", "project-2-r1", "cli"), nil)
+	compare("mutation invalidates continuation tokens", "document.update", "parity-freshness-update", project, write("project-doc-2", "project-2-r2", "project-2-r1", "cli"), nil)
+	for _, test := range []struct {
+		operation string
+		input     map[string]any
+		cliToken  string
+		mcpToken  string
+	}{
+		{"document.list", map[string]any{}, listCLI["page"].(map[string]any)["next_token"].(string), listMCP["page"].(map[string]any)["next_token"].(string)},
+		{"document.history", map[string]any{"document_id": "project-doc"}, historyCLI["page"].(map[string]any)["next_token"].(string), historyMCP["page"].(map[string]any)["next_token"].(string)},
+	} {
+		for _, response := range []map[string]any{invokeCLI(test.operation, "parity-stale-token-cli", project, test.input, map[string]any{"limit": 1, "token": test.cliToken}), invokeMCP(test.operation, "parity-stale-token-mcp", project, test.input, map[string]any{"limit": 1, "token": test.mcpToken})} {
+			if got := response["outcome"].(map[string]any)["code"]; got != app.Conflict {
+				t.Fatalf("stale %s token outcome = %q, want conflict", test.operation, got)
+			}
+		}
+	}
+	for _, root := range []string{cliRoot, mcpRoot} {
+		for _, revision := range []string{"project-r2", "project-r1"} {
+			path := filepath.Join(root, "projects", "project-a", "documents", "project-doc", "revisions", revision+".md")
+			if err := os.WriteFile(path, []byte("tampered"), 0o600); err != nil {
+				t.Fatalf("tamper temporary %s: %v", path, err)
+			}
+		}
+	}
+	for _, test := range []struct{ name, revision string }{{"current integrity", "project-r2"}, {"historical integrity", "project-r1"}} {
+		t.Run(test.name, func(t *testing.T) {
+			cli, mcp := compare(test.name, "document.read", "parity-"+test.revision, project, map[string]any{"document_id": "project-doc", "revision_id": test.revision}, nil)
+			if cli["outcome"].(map[string]any)["code"] != app.IntegrityDiscrepancy || mcp["outcome"].(map[string]any)["code"] != app.IntegrityDiscrepancy {
+				t.Fatalf("%s did not report integrity discrepancy", test.name)
+			}
+		})
+	}
+}
+
+func documentSemanticEnvelope(value map[string]any) map[string]any {
+	encoded, _ := json.Marshal(value)
+	var copy map[string]any
+	_ = json.Unmarshal(encoded, &copy)
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			delete(typed, "created_at")
+			for _, child := range typed {
+				visit(child)
+			}
+		case []any:
+			for _, child := range typed {
+				visit(child)
+			}
+		}
+	}
+	visit(copy)
+	return copy
 }
 
 func TestCommandTransportReapsUnresponsiveChild(t *testing.T) {
