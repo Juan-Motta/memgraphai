@@ -114,3 +114,69 @@ func TestCommandRejectsAnUnknownArgument(t *testing.T) {
 		t.Fatalf("go run . unknown application output = %q, want %q", got, want)
 	}
 }
+
+func TestContinuityCLIProcessUsesHumanAndJSON(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "memgraphai")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+	library := t.TempDir()
+	runJSON := func(id, operation string, scope, input map[string]any) map[string]any {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]any{
+			"contract_version": "memgraphai.experimental/v1alpha1", "operation_id": id,
+			"operation": operation, "scope": scope, "input": input,
+		})
+		command := exec.Command(binary, "--library", library, "--json")
+		command.Stdin = strings.NewReader(string(raw))
+		output, err := command.CombinedOutput()
+		var response map[string]any
+		if decodeErr := json.Unmarshal(output, &response); decodeErr != nil {
+			t.Fatalf("decode %s response %q: %v", operation, output, decodeErr)
+		}
+		code := response["outcome"].(map[string]any)["code"].(string)
+		if (code == "ok") != (err == nil) {
+			t.Fatalf("%s = %v/%#v", operation, err, response)
+		}
+		return response
+	}
+	libraryScope := map[string]any{"kind": "library"}
+	projectScope := map[string]any{"kind": "project", "project_id": "project-a"}
+	workstreamScope := map[string]any{"kind": "workstream", "project_id": "project-a", "workstream_id": "workstream-a"}
+	sessionScope := map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-a", "session_id": "session-a"}
+	if code := runJSON("continuity-project", "project.create", libraryScope, map[string]any{"project_id": "project-a", "name": "Alpha"})["outcome"].(map[string]any)["code"]; code != "ok" {
+		t.Fatalf("project setup = %q, want ok", code)
+	}
+	human := exec.Command(binary, "--library", library, "--operation-id", "continuity-human-workstream", "workstream", "create", "--project-id", "project-a", "--workstream-id", "workstream-human", "--origin", "shell")
+	if output, err := human.CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "ok" {
+		t.Fatalf("human workstream create = %v/%q, want ok", err, output)
+	}
+	assert := func(want, id, operation string, scope, input map[string]any) map[string]any {
+		response := runJSON(id, operation, scope, input)
+		if code := response["outcome"].(map[string]any)["code"]; code != want {
+			t.Fatalf("%s outcome = %q, want %q", operation, code, want)
+		}
+		return response
+	}
+	assert("ok", "continuity-create", "workstream.create", projectScope, map[string]any{"workstream_id": "workstream-a", "origin": "cli"})
+	listed := assert("ok", "continuity-list", "workstream.list", projectScope, map[string]any{})
+	if len(listed["result"].(map[string]any)["workstreams"].([]any)) != 2 {
+		t.Fatalf("workstream list did not return both explicit workstreams: %#v", listed)
+	}
+	assert("ok", "continuity-fork", "workstream.fork", workstreamScope, map[string]any{"workstream_id": "workstream-fork", "origin": "cli"})
+	assert("ok", "continuity-open", "session.open", workstreamScope, map[string]any{"session_id": "session-a", "origin": "cli"})
+	assert("ok", "continuity-status-open", "session.status", sessionScope, map[string]any{})
+	assert("ok", "continuity-disconnect", "session.disconnect", sessionScope, map[string]any{"observed_by": "cli-client"})
+	assert("ok", "continuity-status-disconnected", "session.status", sessionScope, map[string]any{})
+	assert("ok", "continuity-close", "session.close", sessionScope, map[string]any{})
+	closed := assert("ok", "continuity-status-closed", "session.status", sessionScope, map[string]any{})
+	if status := closed["result"].(map[string]any)["status"]; status != "closed" {
+		t.Fatalf("closed status = %q, want closed", status)
+	}
+	resumed := assert("ok", "continuity-resume", "session.resume", workstreamScope, map[string]any{"session_id": "session-resumed", "source_session_id": "session-a", "origin": "cli"})
+	if source := resumed["result"].(map[string]any)["resumed_from_session_id"]; source != "session-a" {
+		t.Fatalf("resume source = %q, want session-a", source)
+	}
+	wrongScope := map[string]any{"kind": "session", "project_id": "project-a", "workstream_id": "workstream-fork", "session_id": "session-a"}
+	assert("binding_mismatch", "continuity-wrong-scope", "session.status", wrongScope, map[string]any{})
+}

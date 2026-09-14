@@ -51,8 +51,14 @@ func Run(ctx context.Context, args []string, in io.Reader, out io.Writer, errOut
 		fmt.Fprintln(errOut, "memgraphai: invalid command")
 		return 2
 	}
+	projects := app.ProjectService{Store: store}
+	continuity := app.ContinuityService{Store: store}
+	handler := projects.Handle
+	if request, code := app.ParseRequest(raw); code == "" && (strings.HasPrefix(request.Operation, "workstream.") || strings.HasPrefix(request.Operation, "session.")) {
+		handler = continuity.Handle
+	}
 	started := time.Now()
-	serialized, response := (app.Service{}).ExecuteJSON(ctx, raw, "cli", app.ProjectService{Store: store}.Handle)
+	serialized, response := (app.Service{}).ExecuteJSON(ctx, raw, "cli", handler)
 	written := 0
 	if jsonMode {
 		written, _ = out.Write(append(serialized, '\n'))
@@ -95,30 +101,22 @@ func parseGlobal(args []string) (library string, jsonMode bool, operationID stri
 }
 
 func commandRequest(operationID string, args []string) ([]byte, error) {
-	if strings.TrimSpace(operationID) == "" || len(args) < 2 || args[0] != "project" {
-		return nil, errors.New("missing project command")
+	if strings.TrimSpace(operationID) == "" || len(args) < 2 {
+		return nil, errors.New("missing command")
 	}
-	operation := "project." + args[1]
+	operation, args, err := commandOperation(args)
+	if err != nil {
+		return nil, err
+	}
 	scope := app.Scope{Kind: "library"}
 	input := map[string]string{}
 	var page *app.Page
-	if args[1] == "association" {
-		if len(args) < 3 {
-			return nil, errors.New("missing association command")
-		}
-		operation = "project.association." + args[2]
-		args = args[3:]
-	} else {
-		args = args[2:]
-	}
 	for len(args) > 0 {
 		if len(args) < 2 || !strings.HasPrefix(args[0], "--") {
 			return nil, errors.New("invalid command argument")
 		}
 		key, value := strings.TrimPrefix(args[0], "--"), args[1]
-		if key == "project-id" {
-			scope = app.Scope{Kind: "project", ProjectID: value}
-		} else if (operation == "project.list" || operation == "project.association.list") && (key == "limit" || key == "token") {
+		if (operation == "project.list" || operation == "project.association.list" || operation == "workstream.list") && (key == "limit" || key == "token") {
 			if page == nil {
 				page = &app.Page{}
 			}
@@ -132,16 +130,68 @@ func commandRequest(operationID string, args []string) ([]byte, error) {
 				page.Token = value
 			}
 		} else {
-			key = strings.ReplaceAll(key, "-", "_")
-			if key == "id" {
-				key = "project_id"
-			}
-			input[key] = value
+			setContinuityScope(&scope, operation, key, value, input)
 		}
 		args = args[2:]
 	}
+	setContinuityScopeKind(&scope, operation)
 	inputJSON, _ := json.Marshal(input)
 	return json.Marshal(app.Request{ContractVersion: app.ContractVersion, OperationID: operationID, Operation: operation, Scope: scope, Input: inputJSON, Page: page})
+}
+
+func commandOperation(args []string) (string, []string, error) {
+	switch args[0] {
+	case "project":
+		if args[1] == "association" {
+			if len(args) < 3 {
+				return "", nil, errors.New("missing association command")
+			}
+			return "project.association." + args[2], args[3:], nil
+		}
+		return "project." + args[1], args[2:], nil
+	case "workstream", "session":
+		return args[0] + "." + args[1], args[2:], nil
+	default:
+		return "", nil, errors.New("unknown command")
+	}
+}
+
+func setContinuityScope(scope *app.Scope, operation, key, value string, input map[string]string) {
+	switch key {
+	case "project-id":
+		scope.ProjectID = value
+	case "workstream-id":
+		if operation == "workstream.fork" || strings.HasPrefix(operation, "session.") {
+			scope.WorkstreamID = value
+		} else {
+			input["workstream_id"] = value
+		}
+	case "session-id":
+		if operation == "session.status" || operation == "session.close" || operation == "session.disconnect" {
+			scope.SessionID = value
+		} else {
+			input["session_id"] = value
+		}
+	case "new-workstream-id":
+		input["workstream_id"] = value
+	default:
+		key = strings.ReplaceAll(key, "-", "_")
+		if key == "id" {
+			key = "project_id"
+		}
+		input[key] = value
+	}
+}
+
+func setContinuityScopeKind(scope *app.Scope, operation string) {
+	switch operation {
+	case "workstream.create", "workstream.list", "project.association.add", "project.association.list", "project.association.remove":
+		scope.Kind = "project"
+	case "workstream.fork", "session.open", "session.resume":
+		scope.Kind = "workstream"
+	case "session.status", "session.close", "session.disconnect":
+		scope.Kind = "session"
+	}
 }
 
 // ResolveLibrary chooses explicit root, owner config, then the owner default.

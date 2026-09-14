@@ -28,7 +28,7 @@ func main() {
 		runMCP(explicit)
 		return
 	}
-	if len(os.Args) < 2 || (os.Args[1] != "project" && os.Args[1] != "--library" && os.Args[1] != "--json" && os.Args[1] != "--operation-id") {
+	if len(os.Args) < 2 || (os.Args[1] != "project" && os.Args[1] != "workstream" && os.Args[1] != "session" && os.Args[1] != "--library" && os.Args[1] != "--json" && os.Args[1] != "--operation-id") {
 		fmt.Fprintln(os.Stderr, "usage: memgraphai probe")
 		os.Exit(2)
 	}
@@ -56,7 +56,7 @@ func runMCP(explicit string) {
 		os.Exit(1)
 	}
 	defer store.Close()
-	if err := mcpadapter.RunStdio(context.Background(), app.ProjectService{Store: store}, app.Service{Recorder: store}); err != nil {
+	if err := mcpadapter.RunStdio(context.Background(), app.ProjectService{Store: store}, app.ContinuityService{Store: store}, app.Service{Recorder: store}); err != nil {
 		fmt.Fprintln(os.Stderr, "memgraphai: mcp stopped")
 		os.Exit(1)
 	}

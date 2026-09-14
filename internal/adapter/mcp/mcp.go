@@ -24,24 +24,33 @@ type ToolInput struct {
 	Page            *app.Page      `json:"page,omitempty"`
 }
 
-// NewServer constructs the six exact project operation tools.
-func NewServer(service app.ProjectService, recorder app.Service) *gomcp.Server {
-	return newServer(service, recorder, nil)
+// NewServer constructs the exact project and continuity operation tools.
+func NewServer(projects app.ProjectService, continuity app.ContinuityService, recorder app.Service) *gomcp.Server {
+	return newServer(projects, continuity, recorder, nil)
 }
 
-func newServer(service app.ProjectService, recorder app.Service, wire *wireMetricWriter) *gomcp.Server {
+func newServer(projects app.ProjectService, continuity app.ContinuityService, recorder app.Service, wire *wireMetricWriter) *gomcp.Server {
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "memgraphai", Version: "v1alpha1"}, nil)
 	for _, operation := range []string{
 		"project.create", "project.list", "project.resolve",
 		"project.association.add", "project.association.list", "project.association.remove",
 	} {
-		addTool(server, operation, service, recorder, wire)
+		addTool(server, operation, projects.Handle, recorder, wire)
+	}
+	for _, operation := range []string{
+		"workstream.create", "workstream.list", "workstream.fork", "session.open",
+		"session.status", "session.close", "session.disconnect", "session.resume",
+	} {
+		addTool(server, operation, continuity.Handle, recorder, wire)
 	}
 	return server
 }
 
-func addTool(server *gomcp.Server, operation string, service app.ProjectService, executor app.Service, wire *wireMetricWriter) {
+func addTool(server *gomcp.Server, operation string, handler app.Handler, executor app.Service, wire *wireMetricWriter) {
 	gomcp.AddTool(server, &gomcp.Tool{Name: operation, Description: "MemGraph AI " + operation}, func(ctx context.Context, _ *gomcp.CallToolRequest, input ToolInput) (*gomcp.CallToolResult, map[string]any, error) {
+		if wire != nil {
+			wire.waitForPending(ctx)
+		}
 		businessInput, _ := json.Marshal(input.Input)
 		raw, _ := json.Marshal(app.Request{ContractVersion: input.ContractVersion, OperationID: input.OperationID, Operation: operation, Scope: input.Scope, Input: businessInput, Page: input.Page})
 		started := time.Now()
@@ -51,7 +60,7 @@ func addTool(server *gomcp.Server, operation string, service app.ProjectService,
 		}
 		var result app.Result
 		serialized, response := recordedExecutor.ExecuteJSON(ctx, raw, "mcp", func(ctx context.Context, request app.Request) app.Result {
-			result = service.Handle(ctx, request)
+			result = handler(ctx, request)
 			return result
 		})
 		if wire != nil {
@@ -66,22 +75,27 @@ func addTool(server *gomcp.Server, operation string, service app.ProjectService,
 }
 
 // RunStdio serves one client-owned MCP stdio connection until EOF.
-func RunStdio(ctx context.Context, service app.ProjectService, executor app.Service) error {
-	return RunIO(ctx, service, executor, os.Stdin, os.Stdout)
+func RunStdio(ctx context.Context, projects app.ProjectService, continuity app.ContinuityService, executor app.Service) error {
+	return RunIO(ctx, projects, continuity, executor, os.Stdin, os.Stdout)
 }
 
 // RunIO permits tests and the executable to use the SDK's newline-delimited stdio framing.
-func RunIO(ctx context.Context, service app.ProjectService, executor app.Service, reader io.ReadCloser, writer io.WriteCloser) error {
-	wire := &wireMetricWriter{WriteCloser: writer, recorder: executor.Recorder, pending: make(map[string]telemetry.Operation)}
-	return newServer(service, executor, wire).Run(ctx, &gomcp.IOTransport{Reader: reader, Writer: wire})
+func RunIO(ctx context.Context, projects app.ProjectService, continuity app.ContinuityService, executor app.Service, reader io.ReadCloser, writer io.WriteCloser) error {
+	wire := &wireMetricWriter{WriteCloser: writer, recorder: executor.Recorder, pending: make(map[string]pendingMetric)}
+	return newServer(projects, continuity, executor, wire).Run(ctx, &gomcp.IOTransport{Reader: reader, Writer: wire})
 }
 
 type wireMetricWriter struct {
 	io.WriteCloser
 	recorder telemetry.Recorder
 	mu       sync.Mutex
-	pending  map[string]telemetry.Operation
+	pending  map[string]pendingMetric
 	frame    []byte
+}
+
+type pendingMetric struct {
+	operation telemetry.Operation
+	done      chan struct{}
 }
 
 func (w *wireMetricWriter) offer(operation telemetry.Operation) {
@@ -90,7 +104,23 @@ func (w *wireMetricWriter) offer(operation telemetry.Operation) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.pending[operation.OperationID] = operation
+	w.pending[operation.OperationID] = pendingMetric{operation: operation, done: make(chan struct{})}
+}
+
+func (w *wireMetricWriter) waitForPending(ctx context.Context) {
+	w.mu.Lock()
+	pending := make([]chan struct{}, 0, len(w.pending))
+	for _, metric := range w.pending {
+		pending = append(pending, metric.done)
+	}
+	w.mu.Unlock()
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (w *wireMetricWriter) Write(data []byte) (int, error) {
@@ -121,13 +151,14 @@ func (w *wireMetricWriter) recordFrame(frame []byte) {
 		return
 	}
 	for _, operationID := range responseOperationIDs(response) {
-		operation, found := w.pending[operationID]
+		metric, found := w.pending[operationID]
 		if !found {
 			continue
 		}
 		delete(w.pending, operationID)
-		operation.ResponseBytes = len(frame)
-		_ = w.recorder.Record(context.Background(), operation)
+		metric.operation.ResponseBytes = len(frame)
+		_ = w.recorder.Record(context.Background(), metric.operation)
+		close(metric.done)
 	}
 }
 
