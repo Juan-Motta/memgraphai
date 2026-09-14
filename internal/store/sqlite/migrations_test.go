@@ -20,12 +20,12 @@ func TestOpenRecordsFoundationMigrationVersion(t *testing.T) {
 	defer store.Close()
 
 	var version int
-	err = store.db.QueryRowContext(t.Context(), "SELECT version FROM schema_migrations").Scan(&version)
+	err = store.db.QueryRowContext(t.Context(), "SELECT MAX(version) FROM schema_migrations").Scan(&version)
 	if err != nil {
 		t.Fatalf("read schema migration version: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("migration version = %d, want 1", version)
+	if version != 2 {
+		t.Fatalf("migration version = %d, want 2", version)
 	}
 }
 
@@ -66,8 +66,8 @@ func TestOpenAppliesMigrationOnceAndPersistsBoundedMetric(t *testing.T) {
 		FROM operation_metrics WHERE operation_id = 'op-metric'`).Scan(&migrations, &bytes, &resultCount); err != nil {
 		t.Fatalf("read persisted migration and metric: %v", err)
 	}
-	if migrations != 1 || bytes != len(serialized) || resultCount != 3 {
-		t.Fatalf("migration/metric = %d/%d/%d, want 1/%d/3", migrations, bytes, resultCount, len(serialized))
+	if migrations != 2 || bytes != len(serialized) || resultCount != 3 {
+		t.Fatalf("migration/metric = %d/%d/%d, want 2/%d/3", migrations, bytes, resultCount, len(serialized))
 	}
 	if err := store.Record(t.Context(), telemetry.Operation{
 		OperationID: "op-no-count", RecordedAt: time.Now(), Interface: "mcp", ScopeKind: "library",

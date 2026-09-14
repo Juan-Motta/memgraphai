@@ -64,10 +64,17 @@ type Outcome struct {
 
 // Response is the exact experimental JSON result envelope emitted by this foundation.
 type Response struct {
-	ContractVersion string          `json:"contract_version"`
-	OperationID     *string         `json:"operation_id"`
-	Outcome         Outcome         `json:"outcome"`
-	Result          json.RawMessage `json:"result,omitempty"`
+	ContractVersion   string          `json:"contract_version"`
+	OperationID       *string         `json:"operation_id"`
+	Outcome           Outcome         `json:"outcome"`
+	Result            json.RawMessage `json:"result,omitempty"`
+	Page              *ResponsePage   `json:"page,omitempty"`
+	MetricResultCount *int            `json:"-"`
+}
+
+// ResponsePage carries an opaque continuation only when another bounded page exists.
+type ResponsePage struct {
+	NextToken string `json:"next_token,omitempty"`
 }
 
 // Result is the bounded transport-neutral value returned by a future concrete service.
@@ -75,6 +82,7 @@ type Result struct {
 	Outcome     string
 	Value       json.RawMessage
 	ResultCount *int
+	Page        *ResponsePage
 }
 
 // Handler is the minimal seam for concrete Phase 1 services added in later work units.
@@ -108,6 +116,7 @@ func (s Service) ExecuteJSON(ctx context.Context, raw []byte, iface string, hand
 		response.Outcome = outcome(result.Outcome)
 		if result.Outcome == OK {
 			response.Result = result.Value
+			response.Page = result.Page
 			resultCount = result.ResultCount
 		}
 	}
@@ -116,6 +125,7 @@ func (s Service) ExecuteJSON(ctx context.Context, raw []byte, iface string, hand
 		response = Response{ContractVersion: ContractVersion, Outcome: outcome(Internal)}
 		serialized, _ = json.Marshal(response)
 	}
+	response.MetricResultCount = resultCount
 	if s.Recorder != nil {
 		_ = s.Recorder.Record(ctx, telemetry.Operation{
 			OperationID:     request.OperationID,
@@ -200,7 +210,7 @@ func validID(value string) bool { return strings.TrimSpace(value) != "" }
 
 func pageable(operation string) bool {
 	switch operation {
-	case "project.list", "workstream.list", "document.list", "document.history", "checkpoint.list":
+	case "project.list", "project.association.list", "workstream.list", "document.list", "document.history", "checkpoint.list":
 		return true
 	default:
 		return false

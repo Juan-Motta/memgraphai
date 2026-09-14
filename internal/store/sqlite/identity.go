@@ -64,7 +64,7 @@ func nullableCount(value *int) any {
 
 func (s *Store) CreateProject(ctx context.Context, id, name string) error {
 	_, err := s.db.ExecContext(ctx, "INSERT INTO projects(project_id, display_name) VALUES (?, ?)", id, name)
-	return err
+	return projectError(err)
 }
 
 // RenameProjectID reaches the SQLite immutability trigger instead of changing identity.
@@ -84,19 +84,7 @@ func (s *Store) ProjectName(ctx context.Context, id string) (string, error) {
 
 // AssociatePath records supplied spelling separately from its resolved identity.
 func (s *Store) AssociatePath(ctx context.Context, projectID, path string) error {
-	resolved, err := resolveExistingPath(path)
-	if err != nil {
-		return err
-	}
-	supplied, err := absolutePath(path)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.ExecContext(ctx,
-		"INSERT INTO project_paths(project_id, supplied_path, resolved_path) VALUES (?, ?, ?)",
-		projectID, supplied, resolved,
-	)
-	return err
+	return s.AddProjectPath(ctx, projectID, path)
 }
 
 // ResolvePath returns explicit association outcomes and never uses a path prefix.

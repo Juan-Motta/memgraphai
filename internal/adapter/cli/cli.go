@@ -1,0 +1,171 @@
+// Package cli normalizes noninteractive project commands into the shared envelope.
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"memgraphai/internal/app"
+	"memgraphai/internal/store/sqlite"
+	"memgraphai/internal/telemetry"
+)
+
+// Run executes one CLI operation and writes only the requested response to out.
+func Run(ctx context.Context, args []string, in io.Reader, out io.Writer, errOut io.Writer) int {
+	library, jsonMode, operationID, rest, err := parseGlobal(args)
+	if err != nil {
+		fmt.Fprintln(errOut, "memgraphai:", err)
+		return 2
+	}
+	root, err := ResolveLibrary(library)
+	if err != nil {
+		fmt.Fprintln(errOut, "memgraphai: library resolution failed")
+		return 1
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		fmt.Fprintln(errOut, "memgraphai: library open failed")
+		return 1
+	}
+	store, err := sqlite.Open(ctx, filepath.Join(root, "database.sqlite"))
+	if err != nil {
+		fmt.Fprintln(errOut, "memgraphai: library open failed")
+		return 1
+	}
+	defer store.Close()
+
+	var raw []byte
+	if jsonMode && len(rest) == 0 {
+		raw, err = io.ReadAll(in)
+	} else {
+		raw, err = commandRequest(operationID, rest)
+	}
+	if err != nil {
+		fmt.Fprintln(errOut, "memgraphai: invalid command")
+		return 2
+	}
+	started := time.Now()
+	serialized, response := (app.Service{}).ExecuteJSON(ctx, raw, "cli", app.ProjectService{Store: store}.Handle)
+	written := 0
+	if jsonMode {
+		written, _ = out.Write(append(serialized, '\n'))
+	} else {
+		written, _ = fmt.Fprintln(out, response.Outcome.Code)
+	}
+	request, _ := app.ParseRequest(raw)
+	_ = store.Record(ctx, telemetry.Operation{
+		OperationID: request.OperationID, RecordedAt: time.Now(), Interface: "cli", ScopeKind: request.Scope.Kind,
+		ProjectID: request.Scope.ProjectID, WorkstreamID: request.Scope.WorkstreamID, SessionID: request.Scope.SessionID,
+		Outcome: response.Outcome.Code, BackendDuration: time.Since(started), ResponseBytes: written, ResultCount: response.MetricResultCount,
+	})
+	if response.Outcome.Code != app.OK {
+		return 1
+	}
+	return 0
+}
+
+func parseGlobal(args []string) (library string, jsonMode bool, operationID string, rest []string, err error) {
+	for len(args) > 0 {
+		switch args[0] {
+		case "--library", "--operation-id":
+			if len(args) < 2 {
+				return "", false, "", nil, errors.New("missing flag value")
+			}
+			if args[0] == "--library" {
+				library = args[1]
+			} else {
+				operationID = args[1]
+			}
+			args = args[2:]
+		case "--json":
+			jsonMode = true
+			args = args[1:]
+		default:
+			return library, jsonMode, operationID, args, nil
+		}
+	}
+	return library, jsonMode, operationID, nil, nil
+}
+
+func commandRequest(operationID string, args []string) ([]byte, error) {
+	if strings.TrimSpace(operationID) == "" || len(args) < 2 || args[0] != "project" {
+		return nil, errors.New("missing project command")
+	}
+	operation := "project." + args[1]
+	scope := app.Scope{Kind: "library"}
+	input := map[string]string{}
+	var page *app.Page
+	if args[1] == "association" {
+		if len(args) < 3 {
+			return nil, errors.New("missing association command")
+		}
+		operation = "project.association." + args[2]
+		args = args[3:]
+	} else {
+		args = args[2:]
+	}
+	for len(args) > 0 {
+		if len(args) < 2 || !strings.HasPrefix(args[0], "--") {
+			return nil, errors.New("invalid command argument")
+		}
+		key, value := strings.TrimPrefix(args[0], "--"), args[1]
+		if key == "project-id" {
+			scope = app.Scope{Kind: "project", ProjectID: value}
+		} else if (operation == "project.list" || operation == "project.association.list") && (key == "limit" || key == "token") {
+			if page == nil {
+				page = &app.Page{}
+			}
+			if key == "limit" {
+				limit, err := strconv.Atoi(value)
+				if err != nil {
+					return nil, errors.New("invalid list limit")
+				}
+				page.Limit = &limit
+			} else {
+				page.Token = value
+			}
+		} else {
+			key = strings.ReplaceAll(key, "-", "_")
+			if key == "id" {
+				key = "project_id"
+			}
+			input[key] = value
+		}
+		args = args[2:]
+	}
+	inputJSON, _ := json.Marshal(input)
+	return json.Marshal(app.Request{ContractVersion: app.ContractVersion, OperationID: operationID, Operation: operation, Scope: scope, Input: inputJSON, Page: page})
+}
+
+// ResolveLibrary chooses explicit root, owner config, then the owner default.
+func ResolveLibrary(explicit string) (string, error) {
+	if explicit != "" {
+		return filepath.Abs(explicit)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	defaultRoot := filepath.Join(home, ".memgraph")
+	config, err := os.ReadFile(filepath.Join(defaultRoot, "config.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return defaultRoot, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var decoded struct {
+		LibraryRoot string `json:"library_root"`
+	}
+	if err := json.Unmarshal(config, &decoded); err != nil || decoded.LibraryRoot == "" {
+		return "", errors.New("invalid library config")
+	}
+	return filepath.Abs(decoded.LibraryRoot)
+}

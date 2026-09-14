@@ -6,7 +6,23 @@ import (
 	"fmt"
 )
 
-const foundationSchemaVersion = 1
+const foundationSchemaVersion = 2
+
+const projectSchemaVersion = 2
+
+var projectSchema = []string{
+	`CREATE TABLE IF NOT EXISTS project_views (
+		singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+		generation INTEGER NOT NULL
+	)`,
+	`INSERT OR IGNORE INTO project_views(singleton, generation) VALUES (1, 0)`,
+	`CREATE TRIGGER IF NOT EXISTS projects_view_after_insert AFTER INSERT ON projects
+		BEGIN UPDATE project_views SET generation = generation + 1 WHERE singleton = 1; END`,
+	`CREATE TRIGGER IF NOT EXISTS paths_view_after_insert AFTER INSERT ON project_paths
+		BEGIN UPDATE project_views SET generation = generation + 1 WHERE singleton = 1; END`,
+	`CREATE TRIGGER IF NOT EXISTS paths_view_after_delete AFTER DELETE ON project_paths
+		BEGIN UPDATE project_views SET generation = generation + 1 WHERE singleton = 1; END`,
+}
 
 var foundationSchema = []string{
 	`CREATE TABLE IF NOT EXISTS projects (
@@ -93,19 +109,28 @@ func applyMigrations(ctx context.Context, db *sql.DB) error {
 	if current > foundationSchemaVersion {
 		return fmt.Errorf("unsupported future schema version %d", current)
 	}
-	if current == foundationSchemaVersion {
-		return tx.Commit()
-	}
-	for _, statement := range foundationSchema {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("apply foundation migration: %w", err)
+	if current < 1 {
+		for _, statement := range foundationSchema {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply foundation migration: %w", err)
+			}
+		}
+		if err := upgradeLegacyOperationColumns(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (1)"); err != nil {
+			return fmt.Errorf("record foundation migration: %w", err)
 		}
 	}
-	if err := upgradeLegacyOperationColumns(ctx, tx); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", foundationSchemaVersion); err != nil {
-		return fmt.Errorf("record foundation migration: %w", err)
+	if current < projectSchemaVersion {
+		for _, statement := range projectSchema {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("apply project migration: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version) VALUES (?)", projectSchemaVersion); err != nil {
+			return fmt.Errorf("record project migration: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit foundation migration: %w", err)
