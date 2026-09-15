@@ -20,6 +20,9 @@ func (e DocumentError) OutcomeCode() string { return e.Code }
 
 // RegisterDocumentCreate atomically binds an initially invisible row to its complete request.
 func (s *Store) RegisterDocumentCreate(ctx context.Context, operationID, documentID, projectID, workstreamID, revisionID string, expectedRevision *string, content []byte, origin, client, model string, createdAt time.Time) error {
+	if !validPublicationIDs(operationID, projectID, documentID, revisionID) {
+		return DocumentError{Code: "invalid"}
+	}
 	request := OperationRequest{ID: operationID, Fingerprint: "document-write", ProjectID: projectID, WorkstreamID: workstreamID,
 		DocumentID: documentID, RevisionID: revisionID, ExpectedCurrent: expectedRevision, Markdown: content,
 		Origin: origin, Client: client, Model: model, CreatedAt: createdAt}
@@ -34,6 +37,9 @@ func (s *Store) RegisterDocumentCreate(ctx context.Context, operationID, documen
 	var actualProject, actualWorkstream string
 	err = tx.QueryRowContext(ctx, `SELECT project_id, COALESCE(workstream_id, '') FROM documents WHERE document_id = ?`, documentID).Scan(&actualProject, &actualWorkstream)
 	if errors.Is(err, sql.ErrNoRows) {
+		if err := ensureRevisionAvailable(ctx, tx, revisionID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO documents(document_id, project_id, workstream_id, current_revision_id) VALUES (?, ?, ?, NULL)`, documentID, projectID, nullableValue(workstreamID)); err != nil {
 			return documentStoreError(err)
 		}
@@ -284,4 +290,16 @@ func documentStoreError(err error) error {
 		return DocumentError{Code: "conflict"}
 	}
 	return fmt.Errorf("document store: %w", err)
+}
+
+func validPublicationIDs(operationID, projectID, documentID, revisionID string) bool {
+	if len(documentID) > 128 || len(revisionID) > 128 {
+		return false
+	}
+	for _, id := range []string{operationID, projectID, documentID, revisionID} {
+		if !revisionfs.ValidPathID(id) {
+			return false
+		}
+	}
+	return true
 }

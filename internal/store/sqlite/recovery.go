@@ -36,7 +36,6 @@ type OperationRequest struct {
 	Client          string
 	Model           string
 	CreatedAt       time.Time
-	MaxAttempts     int
 }
 
 // OperationResult is the durable terminal result, not a transport acknowledgement.
@@ -70,6 +69,9 @@ func (s *Store) ExecuteOperation(ctx context.Context, files *revisionfs.Filesyst
 // ClaimOperation atomically registers or takes over a nonterminal operation.
 // A later generation fences every prior owner from the SQLite publication commit.
 func (s *Store) ClaimOperation(ctx context.Context, request OperationRequest) (OperationResult, error) {
+	if !validPublicationIDs(request.ID, request.ProjectID, request.DocumentID, request.RevisionID) {
+		return OperationResult{}, DocumentError{Code: "invalid"}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return OperationResult{}, mapRecoveryError(err)
@@ -113,16 +115,10 @@ func (s *Store) ClaimOperation(ctx context.Context, request OperationRequest) (O
 		}
 		return storedResult(resultOutcome, resultRevision, generation), nil
 	}
-	maxAttempts := request.MaxAttempts
-	if maxAttempts == 0 {
-		maxAttempts = 3
+	if err := ensureRevisionAvailable(ctx, tx, request.RevisionID); err != nil {
+		return OperationResult{}, err
 	}
-	if generation >= int64(maxAttempts) {
-		if err := tx.Commit(); err != nil {
-			return OperationResult{}, mapRecoveryError(err)
-		}
-		return OperationResult{Outcome: domain.Retryable, Generation: generation}, nil
-	}
+	// Each explicit invocation claims once; lifetime retries do not exhaust recovery.
 	generation++
 	if _, err := tx.ExecContext(ctx, `UPDATE operations SET state = ?, owner_generation = ?
 		WHERE operation_id = ? AND owner_generation = ? AND state IN (?, ?)`, operationOwned, generation,
@@ -170,13 +166,28 @@ func (s *Store) commitOperation(ctx context.Context, request OperationRequest, p
 	if current.Valid {
 		predecessor = current.String
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO revisions(
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO revisions(
 		revision_id, document_id, predecessor_revision_id, file_path, checksum, byte_count,
 		origin, client_provenance, model_provenance, created_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, request.RevisionID, request.DocumentID, predecessor,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(revision_id) DO NOTHING`, request.RevisionID, request.DocumentID, predecessor,
 		prepared.Path, prepared.Checksum, prepared.Bytes, defaultOrigin(request.Origin), nullableValue(request.Client),
-		nullableValue(request.Model), nullableTime(request.CreatedAt)); err != nil {
+		nullableValue(request.Model), nullableTime(request.CreatedAt))
+	if err != nil {
 		return OperationResult{}, mapRecoveryError(err)
+	}
+	rows, err := inserted.RowsAffected()
+	if err != nil {
+		return OperationResult{}, mapRecoveryError(err)
+	}
+	if rows == 0 {
+		result, err := s.recordTerminal(ctx, tx, request.ID, generation, domain.Conflict, "")
+		if err != nil {
+			return OperationResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationResult{}, mapRecoveryError(err)
+		}
+		return result, nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE documents SET current_revision_id = ? WHERE document_id = ?`, request.RevisionID, request.DocumentID); err != nil {
 		return OperationResult{}, mapRecoveryError(err)
@@ -383,4 +394,17 @@ func mapRecoveryError(err error) error {
 		return domain.Error{Outcome: domain.IntegrityDiscrepancy}
 	}
 	return fmt.Errorf("recovery store: %w", err)
+}
+
+// ensureRevisionAvailable avoids filesystem preparation for a known global ID collision.
+// Publication still enforces the unique constraint inside its commit transaction.
+func ensureRevisionAvailable(ctx context.Context, tx *sql.Tx, revisionID string) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM revisions WHERE revision_id = ?)`, revisionID).Scan(&exists); err != nil {
+		return mapRecoveryError(err)
+	}
+	if exists {
+		return domain.Error{Outcome: domain.Conflict}
+	}
+	return nil
 }

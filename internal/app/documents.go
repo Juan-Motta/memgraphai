@@ -92,6 +92,9 @@ type documentWriteInput struct {
 }
 
 func (s DocumentService) write(ctx context.Context, request Request, create bool) Result {
+	if !revisionfs.ValidPathID(request.OperationID) {
+		return Result{Outcome: Invalid}
+	}
 	projectID, workstreamID, code := documentScope(request.Scope)
 	if code != "" {
 		return Result{Outcome: code}
@@ -299,12 +302,12 @@ func encodeDocumentPage(request Request, order, filter, cursor string, rowID, vi
 func documentScope(scope Scope) (string, string, string) {
 	switch scope.Kind {
 	case "project":
-		if !validDocumentID(scope.ProjectID) {
+		if !revisionfs.ValidPathID(scope.ProjectID) {
 			return "", "", Invalid
 		}
 		return scope.ProjectID, "", ""
 	case "workstream":
-		if !validDocumentID(scope.ProjectID) || !validDocumentID(scope.WorkstreamID) {
+		if !revisionfs.ValidPathID(scope.ProjectID) || (!validID(scope.WorkstreamID) || len(scope.WorkstreamID) > 128) {
 			return "", "", Invalid
 		}
 		return scope.ProjectID, scope.WorkstreamID, ""
@@ -330,9 +333,9 @@ func documentResult(value any, count int) Result {
 	}
 	return Result{Outcome: OK, Value: encoded, ResultCount: intPointer(count)}
 }
-func validDocumentID(value string) bool { return validID(value) && len(value) <= 128 }
+func validDocumentID(value string) bool { return len(value) <= 128 && revisionfs.ValidPathID(value) }
 func validDocumentProvenance(value DocumentProvenance) bool {
-	return validDocumentID(value.Origin) && len(value.Client) <= 128 && len(value.Model) <= 128
+	return validID(value.Origin) && len(value.Origin) <= 128 && len(value.Client) <= 128 && len(value.Model) <= 128
 }
 func dereference(value *string) string {
 	if value == nil {

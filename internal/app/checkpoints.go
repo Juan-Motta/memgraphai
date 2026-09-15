@@ -81,11 +81,14 @@ type checkpointSaveInput struct {
 }
 
 func (s CheckpointService) save(ctx context.Context, request Request) Result {
-	if request.Scope.Kind != "session" || !validCheckpointID(request.Scope.ProjectID) || !validCheckpointID(request.Scope.WorkstreamID) || !validCheckpointID(request.Scope.SessionID) {
+	if !revisionfs.ValidPathID(request.OperationID) || !revisionfs.ValidPathID(request.Scope.ProjectID) {
+		return Result{Outcome: Invalid}
+	}
+	if request.Scope.Kind != "session" || !revisionfs.ValidPathID(request.Scope.ProjectID) || !validCheckpointID(request.Scope.WorkstreamID) || !validCheckpointID(request.Scope.SessionID) {
 		return Result{Outcome: ScopeDenied}
 	}
 	var input checkpointSaveInput
-	if err := decodeStrict(request.Input, &input); err != nil || !validCheckpointID(input.CheckpointID) || !validCheckpointID(input.CheckpointDocumentID) || !validCheckpointID(input.CheckpointRevisionID) || !validCheckpointProvenance(input.Provenance) || !validCheckpointReferences(input.References) {
+	if err := decodeStrict(request.Input, &input); err != nil || !validCheckpointID(input.CheckpointID) || !validDocumentID(input.CheckpointDocumentID) || !validDocumentID(input.CheckpointRevisionID) || !validCheckpointProvenance(input.Provenance) || !validCheckpointReferences(input.References) {
 		return Result{Outcome: Invalid}
 	}
 	prose, err := decodeCheckpointProse(input.ProseBase64)
@@ -107,7 +110,7 @@ func (s CheckpointService) save(ctx context.Context, request Request) Result {
 }
 
 func (s CheckpointService) read(ctx context.Context, request Request) Result {
-	if request.Scope.Kind != "session" || !validCheckpointID(request.Scope.ProjectID) || !validCheckpointID(request.Scope.WorkstreamID) || !validCheckpointID(request.Scope.SessionID) {
+	if request.Scope.Kind != "session" || !revisionfs.ValidPathID(request.Scope.ProjectID) || !validCheckpointID(request.Scope.WorkstreamID) || !validCheckpointID(request.Scope.SessionID) {
 		return Result{Outcome: ScopeDenied}
 	}
 	var input struct {

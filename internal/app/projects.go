@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 
 	"memgraphai/internal/domain"
+	"memgraphai/internal/revisionfs"
 )
 
 // ProjectStore is the narrow concrete persistence surface needed by P1.2.
@@ -54,7 +55,7 @@ func (s ProjectService) create(ctx context.Context, request Request) Result {
 		ProjectID string `json:"project_id"`
 		Name      string `json:"name"`
 	}
-	if err := decodeProjectInput(request.Input, &input); err != nil || !validID(input.ProjectID) || !validID(input.Name) {
+	if err := decodeProjectInput(request.Input, &input); err != nil || !revisionfs.ValidPathID(input.ProjectID) || !validID(input.Name) {
 		return Result{Outcome: Invalid}
 	}
 	if err := s.Store.CreateProject(ctx, input.ProjectID, input.Name); err != nil {

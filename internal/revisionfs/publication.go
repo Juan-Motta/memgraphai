@@ -68,7 +68,7 @@ func (f *Filesystem) PrepareAttempt(operationID string, generation int64, projec
 
 func (f *Filesystem) prepare(operationID, generation, projectID, documentID, revisionID string, markdown []byte) (Prepared, error) {
 	for _, id := range []string{operationID, projectID, documentID, revisionID} {
-		if !safeComponent(id) {
+		if !ValidPathID(id) {
 			return Prepared{}, fmt.Errorf("%w: %q", ErrUnsafeID, id)
 		}
 	}
@@ -295,8 +295,10 @@ func syncDir(path string) error {
 	return dir.Sync()
 }
 
-func safeComponent(value string) bool {
-	if value == "" || value == "." || value == ".." {
+// ValidPathID reports whether an identifier fits a 255-byte filesystem component
+// and contains only the ASCII characters used by library paths.
+func ValidPathID(value string) bool {
+	if value == "" || len(value) > 255 {
 		return false
 	}
 	for _, character := range value {

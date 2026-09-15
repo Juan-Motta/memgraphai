@@ -42,6 +42,9 @@ type checkpointClaim struct {
 // SaveCheckpoint registers the complete immutable request before publication, then commits
 // its backing revision, pointer, checkpoint metadata, references, and terminal result together.
 func (s *Store) SaveCheckpoint(ctx context.Context, files *revisionfs.Filesystem, operationID, checkpointID, checkpointDocumentID, checkpointRevisionID, projectID, workstreamID, sessionID string, prose, referencesJSON []byte, origin, client, model string, createdAt time.Time) error {
+	if !validPublicationIDs(operationID, projectID, checkpointDocumentID, checkpointRevisionID) {
+		return CheckpointError{Code: "invalid"}
+	}
 	references, err := decodeCheckpointReferences(referencesJSON)
 	if err != nil {
 		return CheckpointError{Code: "invalid"}
@@ -74,6 +77,9 @@ func (s *Store) claimCheckpoint(ctx context.Context, operationID, checkpointID, 
 	var generation int64
 	err = tx.QueryRowContext(ctx, `SELECT fingerprint, state, owner_generation FROM operations WHERE operation_id = ?`, operationID).Scan(&storedDigest, &state, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
+		if err := ensureRevisionAvailable(ctx, tx, revisionID); err != nil {
+			return checkpointClaim{}, err
+		}
 		var count int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM checkpoints WHERE checkpoint_id = ?`, checkpointID).Scan(&count); err != nil {
 			return checkpointClaim{}, mapRecoveryError(err)
@@ -103,13 +109,13 @@ func (s *Store) claimCheckpoint(ctx context.Context, operationID, checkpointID, 
 		if err := tx.Commit(); err != nil {
 			return checkpointClaim{}, mapRecoveryError(err)
 		}
+		if state == operationConflict {
+			return checkpointClaim{outcome: domain.Conflict}, CheckpointError{Code: "conflict"}
+		}
 		return checkpointClaim{outcome: domain.Outcome(state)}, nil
 	}
-	if generation >= 3 {
-		if err := tx.Commit(); err != nil {
-			return checkpointClaim{}, mapRecoveryError(err)
-		}
-		return checkpointClaim{outcome: domain.Retryable}, CheckpointError{Code: "retryable"}
+	if err := ensureRevisionAvailable(ctx, tx, revisionID); err != nil {
+		return checkpointClaim{}, err
 	}
 	generation++
 	if _, err := tx.ExecContext(ctx, `UPDATE operations SET state = ?, owner_generation = ? WHERE operation_id = ? AND owner_generation = ? AND state IN (?, ?)`, operationOwned, generation, operationID, generation-1, operationRegistered, operationOwned); err != nil {
@@ -138,14 +144,31 @@ func (s *Store) commitCheckpoint(ctx context.Context, operationID, checkpointID,
 	if storedDigest != digest {
 		return domain.Error{Outcome: domain.IdempotencyMismatch}
 	}
-	if state == operationCommitted || state == operationConflict {
+	if state == operationCommitted {
 		return nil
+	}
+	if state == operationConflict {
+		return CheckpointError{Code: "conflict"}
 	}
 	if state != operationOwned || owner != generation {
 		return domain.Error{Outcome: domain.Retryable}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO revisions(revision_id, document_id, predecessor_revision_id, file_path, checksum, byte_count, origin, client_provenance, model_provenance, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`, revisionID, documentID, prepared.Path, prepared.Checksum, prepared.Bytes, defaultOrigin(origin), nullableValue(client), nullableValue(model), nullableTime(createdAt)); err != nil {
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO revisions(revision_id, document_id, predecessor_revision_id, file_path, checksum, byte_count, origin, client_provenance, model_provenance, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(revision_id) DO NOTHING`, revisionID, documentID, prepared.Path, prepared.Checksum, prepared.Bytes, defaultOrigin(origin), nullableValue(client), nullableValue(model), nullableTime(createdAt))
+	if err != nil {
 		return documentStoreError(err)
+	}
+	insertedRows, err := inserted.RowsAffected()
+	if err != nil {
+		return mapRecoveryError(err)
+	}
+	if insertedRows == 0 {
+		if _, err := s.recordTerminal(ctx, tx, operationID, generation, domain.Conflict, ""); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return mapRecoveryError(err)
+		}
+		return CheckpointError{Code: "conflict"}
 	}
 	updated, err := tx.ExecContext(ctx, `UPDATE documents SET current_revision_id = ? WHERE document_id = ? AND current_revision_id IS NULL`, revisionID, documentID)
 	if err != nil {

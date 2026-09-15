@@ -146,7 +146,7 @@ func TestRecoveryProcessCommittedBeforeResponseReplaysAfterLaterAdvance(t *testi
 	}
 }
 
-func TestRecoveryBoundsCrossProcessRetryExhaustion(t *testing.T) {
+func TestRecoveryBoundsEachCrossProcessRetryWithoutExhaustingRecovery(t *testing.T) {
 	database, library := processFixture(t)
 	store, err := Open(t.Context(), database)
 	if err != nil {
@@ -157,15 +157,14 @@ func TestRecoveryBoundsCrossProcessRetryExhaustion(t *testing.T) {
 	child := startRecoveryHelper(t, "claim", database, library, ready)
 	waitForFile(t, ready)
 	request := operationRequest("operation-1", "fingerprint-1", "revision-1", nil, "# first\n")
-	request.MaxAttempts = 2
 	if claimed, err := store.ClaimOperation(t.Context(), request); err != nil || claimed.Generation != 2 {
 		t.Fatalf("ClaimOperation(simultaneous retry) = %#v, %v; want generation 2", claimed, err)
 	}
 	started := time.Now()
 	exhausted, err := store.ClaimOperation(t.Context(), request)
 	elapsed := time.Since(started)
-	if err != nil || exhausted.Outcome != domain.Retryable || exhausted.Generation != 2 {
-		t.Fatalf("ClaimOperation(exhausted) = %#v, %v; want stable retryable generation 2", exhausted, err)
+	if err != nil || exhausted.Outcome != "" || exhausted.Generation != 3 {
+		t.Fatalf("ClaimOperation(exhausted) = %#v, %v; want one bounded new claim at generation 3", exhausted, err)
 	}
 	if elapsed > time.Second {
 		t.Fatalf("ClaimOperation() waited %s, want bounded under 1s", elapsed)

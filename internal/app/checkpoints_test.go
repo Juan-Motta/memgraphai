@@ -45,9 +45,10 @@ func TestCheckpointSaveRejectsDuplicateExactReferences(t *testing.T) {
 
 func TestCheckpointSaveRequiresAnActiveExplicitSessionBinding(t *testing.T) {
 	request := Request{
-		Operation: "checkpoint.save",
-		Scope:     Scope{Kind: "session", ProjectID: "project-a", WorkstreamID: "workstream-a", SessionID: "session-a"},
-		Input:     json.RawMessage(`{"checkpoint_id":"checkpoint-a","checkpoint_document_id":"checkpoint-document-a","checkpoint_revision_id":"checkpoint-revision-a","prose_base64":"IyBoYW5kb2ZmCg","references":[{"document_id":"source-document-a","revision_id":"source-revision-a"}],"provenance":{"origin":"cli"}}`),
+		Operation:   "checkpoint.save",
+		OperationID: "checkpoint-save",
+		Scope:       Scope{Kind: "session", ProjectID: "project-a", WorkstreamID: "workstream-a", SessionID: "session-a"},
+		Input:       json.RawMessage(`{"checkpoint_id":"checkpoint-a","checkpoint_document_id":"checkpoint-document-a","checkpoint_revision_id":"checkpoint-revision-a","prose_base64":"IyBoYW5kb2ZmCg","references":[{"document_id":"source-document-a","revision_id":"source-revision-a"}],"provenance":{"origin":"cli"}}`),
 	}
 	result := (CheckpointService{Store: checkpointStoreStub{}, Files: revisionfs.New(t.TempDir(), nil), Now: func() time.Time { return time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC) }}).Handle(t.Context(), request)
 	if result.Outcome != OK {
