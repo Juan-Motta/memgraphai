@@ -140,7 +140,7 @@ After P0.4 records a viable Phase 0 exit, P1.0 may run as contract decision/desi
 
 **Estimated diff:** 220–380 lines. **Depends on:** P1.1–P1.5. **Start:** each feature unit passes focused checks. **Finish:** `internal/testkit/`, both adapters, `internal/store/sqlite/`, `internal/revisionfs/`, and `docs/evidence/phase1-verification.md` cover parity, crash restart, integrity, idempotency, pagination, and concurrent processes. **Verify:** use `go test ./...` only if the apply phase establishes a configured runner; record toolchain limitations instead of claiming success. **Rollback:** remove hardening-only fixtures/evidence without reverting independently usable units.
 
-- [ ] Add cross-cutting tests and close only observed gaps in `internal/testkit/`, `internal/adapter/cli/`, `internal/adapter/mcp/`, `internal/store/sqlite/`, and `internal/revisionfs/`; run RED → GREEN → TRIANGULATE → REFACTOR, then record actual commands, results, and limitations in `docs/evidence/phase1-verification.md` without adding deferred features. <!-- sdd-owner: implementation -->
+- [x] Add cross-cutting tests and close only observed gaps in `internal/testkit/`, `internal/adapter/cli/`, `internal/adapter/mcp/`, `internal/store/sqlite/`, and `internal/revisionfs/`; run RED → GREEN → TRIANGULATE → REFACTOR, then record actual commands, results, and limitations in `docs/evidence/phase1-verification.md` without adding deferred features. <!-- sdd-owner: implementation -->
 
 **TDD evidence:** RED covers bounded responses, pagination edges, scope mixing, raw lock leakage, metric failure, crash windows, stale writes, and unknown outcomes; GREEN fixes observed gaps; TRIANGULATE combines deterministic fixtures, protocol clients, fault injection, and multi-process contention; REFACTOR removes duplication and unsupported claims.
 
@@ -148,4 +148,4 @@ After P0.4 records a viable Phase 0 exit, P1.0 may run as contract decision/desi
 
 ## Verification and planning guard
 
-The Go runner is verified, and current focused and full-suite evidence supports completed tasks through P1.5. Keep P1.6 pending until its cross-cutting hardening work and `docs/evidence/phase1-verification.md` record actual commands, results, and limitations; do not claim final Phase 1 verification from earlier task evidence.
+The Go runner is verified, and current focused and full-suite evidence supports completed implementation tasks through P1.6. `docs/evidence/phase1-verification.md` records the cross-cutting apply evidence; independent SDD verification remains a separate phase and is not claimed by task completion.

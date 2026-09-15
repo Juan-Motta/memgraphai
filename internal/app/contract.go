@@ -14,6 +14,8 @@ import (
 
 const ContractVersion = "memgraphai.experimental/v1alpha1"
 
+const serializedResponseLimit = 2 << 20
+
 const (
 	OK                         = "ok"
 	Invalid                    = "invalid"
@@ -121,8 +123,9 @@ func (s Service) ExecuteJSON(ctx context.Context, raw []byte, iface string, hand
 		}
 	}
 	serialized, err := json.Marshal(response)
-	if err != nil {
-		response = Response{ContractVersion: ContractVersion, Outcome: outcome(Internal)}
+	if err != nil || len(serialized) > serializedResponseLimit {
+		resultCount = nil
+		response = Response{ContractVersion: ContractVersion, OperationID: response.OperationID, Outcome: outcome(Internal)}
 		serialized, _ = json.Marshal(response)
 	}
 	response.MetricResultCount = resultCount

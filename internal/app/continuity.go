@@ -293,12 +293,14 @@ type codedContinuityError interface{ OutcomeCode() string }
 func continuityOutcome(err error) string {
 	if coded, ok := err.(codedContinuityError); ok {
 		switch coded.OutcomeCode() {
-		case NotFound, Conflict:
+		case NotFound, Conflict, Busy, Retryable:
 			return coded.OutcomeCode()
 		}
 	}
-	if domain.IsOutcome(err, domain.BindingMismatch) {
-		return BindingMismatch
+	for _, outcome := range []domain.Outcome{domain.BindingMismatch, domain.Busy, domain.Retryable} {
+		if domain.IsOutcome(err, outcome) {
+			return string(outcome)
+		}
 	}
 	return Internal
 }

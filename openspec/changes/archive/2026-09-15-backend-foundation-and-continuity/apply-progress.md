@@ -1043,3 +1043,64 @@ The evidence note records the complete chronological commands and does not relab
 - Both five-run repetitions passed: real CLI/MCP checkpoint parity and independently captured MCP frame metrics.
 - `go test ./... -count=1 -timeout=120s` passed for the full Go suite.
 - `git diff --check` passed.
+
+---
+
+## P1.6 cross-cutting hardening and verification evidence
+
+### Status, authority, and completed task
+
+- Consumed authoritative `gentle-ai.sdd-status@2`: `apply: ready`, repository-local workspace `/Users/juanmotta/Desktop/personal/memgraphai`, that workspace as the sole allowed edit root, and no action-context warnings.
+- The user explicitly authorized only the remaining P1.6 work unit with a 2,000 changed-line budget and deferred chaining. The workload forecast was resolved as this bounded, estimated 220–380-line implementation slice; no PR, chain, `size:exception`, commit, push, or review actor was used.
+- Continued native attempt `sha256:e90236059f13ca6a09996fa5aaa94a48516f8a53a830bda183360731a9a97697` with request `p16-apply-1789423145-23972` and received `proceed`. Per instruction, this worker did not settle the parent-owned attempt.
+- [x] P1.6 — cross-cutting hardening tests/fixes and `docs/evidence/phase1-verification.md` are complete. The exact implementation-owned row in `tasks.md` was changed to `- [x]` after acceptance and re-read visibly checked. No other task checkbox changed; no implementation task remains unchecked.
+
+### Observed gaps closed
+
+- `internal/app/contract.go` now caps the shared serialized response at 2 MiB. Oversized or malformed successful handler output becomes a small correlated `internal` envelope without partial result/count data, and telemetry records the actual fallback bytes.
+- Project and continuity SQLite writes now reuse the established busy classifier instead of leaking raw lock failures upward. Their application outcome mappers preserve stable `busy` and `retryable` outcomes.
+- Existing adapter, pagination, fault-injection, recovery-process, checksum, stale-write, idempotency, checkpoint, and metric tests were combined into the P1.6 acceptance matrix. No duplicate feature behavior or deferred capability was added.
+
+### TDD Cycle Evidence
+
+| Task | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Bounded shared responses | `internal/app/contract_test.go` | Shared contract integration | `go test ./... -count=1 -timeout=120s` PASS before edits | Oversized successful result stayed `ok` with 2,097,167 result bytes instead of a bounded fallback | Focused test PASS after a 2 MiB serialized-envelope guard | Ordinary nonempty success remains `ok`; malformed handler JSON becomes bounded valid `internal` JSON with the same valid operation ID | Named shared limit and one fallback path; `gofmt` and focused package tests PASS |
+| Stable project/continuity contention | `internal/app/contract_test.go` with real SQLite connections | Application/SQLite integration | Full suite and focused app/store suites PASS | Project and continuity locked writes both returned `internal`, want `busy` | Both focused subtests PASS after store classification and app outcome mapping | Two service paths under independent locks passed; the cross-cutting app matrix passed five times and existing helper-process exhaustion remained green | Reused `mapRecoveryError`; no second driver-string classifier; focused/full suites PASS |
+
+The first oversized RED printed the entire payload; its test-only diagnostic was narrowed and the same behavioral RED was rerun before production code changed.
+
+### Files changed
+
+- `internal/app/contract.go`, `internal/app/contract_test.go`
+- `internal/app/projects.go`, `internal/app/continuity.go`
+- `internal/store/sqlite/projects.go`, `internal/store/sqlite/continuity.go`
+- `docs/evidence/phase1-verification.md`
+- `openspec/changes/backend-foundation-and-continuity/tasks.md`
+- `openspec/changes/backend-foundation-and-continuity/apply-progress.md`
+
+### Verification commands and results
+
+| Command | Result |
+| --- | --- |
+| Initial `go test ./... -count=1 -timeout=120s` | PASS safety net for every Go package; `internal/telemetry` has no standalone tests. |
+| New bounded-response focused RED/GREEN commands | Expected behavioral RED, then PASS GREEN. |
+| New contention focused RED/GREEN command | Expected behavioral RED in both project and continuity cases, then PASS GREEN. |
+| Focused app hardening/pagination/metric matrix with `-count=5` | PASS. |
+| Real CLI/MCP continuity, EOF/scope, document, checkpoint, and exact-frame metric matrix | PASS. |
+| Focused SQLite operation/recovery/targeted/document/checkpoint matrix | PASS. |
+| Focused revision filesystem prepare/read/verify matrix | PASS. |
+| `go test ./internal/app ./internal/store/sqlite -count=1 -timeout=120s` | PASS. |
+| Final `go test ./... -count=1 -timeout=120s` | PASS. |
+| `git diff --check` | PASS. |
+| `pgrep -x memgraphai \| wc -l` | `0`; no adapter process remained. |
+
+Evidence SHA-256: `5fbb15e275c34f5c3e31c57de5285027a032f970d8c1281e0e6ba37bad26d66f` for `docs/evidence/phase1-verification.md`.
+
+### Design conformance, workload, risks, and remaining work
+
+- The implementation preserves shared concrete services, stable outcomes, explicit request scope, best-effort telemetry, SQLite/Markdown authority, and the existing no-daemon/no-HTTP boundary.
+- Tracked source/test/task changes are 143 additions plus 10 deletions; the new verification evidence is 61 lines. Including this cumulative progress addendum remains far below the user-authorized 2,000 changed-line limit and within the P1.6 work-unit estimate. No delivery exception is needed.
+- Deterministic contention uses separate SQLite connections and the configured 100 ms busy timeout; helper-process tests provide separate-process fencing/exhaustion evidence. This is not a throughput target or proof of every scheduler interleaving. Real CLI/MCP parity runs are present, but no synthetic long-held lock was held across both adapters simultaneously.
+- Local sync, injected faults, and process termination do not prove physical power-loss, backup, network-filesystem, release-platform, or unsupported macOS behavior.
+- No implementation-owned `- [ ]` line remains. The next phase is independent `sdd-verify`; task completion does not itself claim that independent verification result.

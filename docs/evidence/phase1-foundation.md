@@ -96,3 +96,15 @@ or external integration was used.
 2. The nil-handler regression supplied an independent genuine RED/GREEN cycle without repairing that history.
 3. P1.1 implementation is accepted only under the explicit narrow exception; future strict-TDD duties remain unchanged.
 4. Prior passing verification is historical; fresh verification and native review remain parent-owned and pending.
+
+## Production-recorder metric-isolation remediation
+
+The historical P1.1 metric-isolation RED remains TESTONLY evidence and is not rewritten by this remediation. `TestExecuteJSONIgnoresProductionRecorderFailure` now exercises `Service.Recorder` with the real `internal/store/sqlite.Store`: the first request persists the operation metric, while the same valid operation ID on the second request reaches SQLite's duplicate-primary-key failure. Both business responses remain `ok`, their serialized response and result are unchanged, the handler runs twice, and exactly one metric row remains persisted.
+
+No recorder-propagation mutation or failing production baseline was available within this regression's allowed edit surface, so no new RED is claimed. GREEN was observed on the current implementation. Triangulation covers the first successful persistence, the second duplicate-ID rejection, two successful business executions, stable correlation/result count, and byte-identical responses.
+
+| Command | Result |
+| --- | --- |
+| `go test ./internal/app -run '^TestExecuteJSONIgnoresProductionRecorderFailure$' -count=1 -timeout=120s` | PASS (`ok memgraphai/internal/app`) |
+
+This additive regression does not alter the accepted historical TESTONLY limitation or any unrelated P1.1 history.

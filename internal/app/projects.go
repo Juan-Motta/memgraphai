@@ -202,9 +202,15 @@ type codedProjectError interface{ OutcomeCode() string }
 func projectErrorOutcome(err error) string {
 	if coded, ok := err.(codedProjectError); ok {
 		switch coded.OutcomeCode() {
-		case Conflict, NotFound:
+		case Conflict, NotFound, Busy, Retryable:
 			return coded.OutcomeCode()
 		}
+	}
+	if domain.IsOutcome(err, domain.Busy) {
+		return Busy
+	}
+	if domain.IsOutcome(err, domain.Retryable) {
+		return Retryable
 	}
 	return Internal
 }

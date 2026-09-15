@@ -182,7 +182,7 @@ func projectError(err error) error {
 	if strings.Contains(err.Error(), "constraint") || strings.Contains(err.Error(), "UNIQUE") {
 		return ProjectError{Code: projectConflict}
 	}
-	return err
+	return mapRecoveryError(err)
 }
 
 func isProjectNotFound(err error) bool {

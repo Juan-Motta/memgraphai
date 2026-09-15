@@ -5,24 +5,26 @@ context: |
   Treat docs/PROJECT.md as the settled product source; preserve its confirmed, proposed, and open-decision labels.
   The product is implemented as one Go executable for macOS with shared CLI and MCP application services.
   SQLite owns operational state, Markdown owns document prose, and core retrieval must work without embeddings.
-  Phase 0 is complete. Phase 1 tasks P1.1–P1.5 are implemented; P1.6 remains pending and must not be treated as complete without its required evidence.
+  Phase 0 is complete. Phase 1 tasks P1.1–P1.6 are implemented (11/11 implementation tasks); the canonical verify-report records the current independent verification verdict under the narrow P1.1 closure exception.
   The repository has Go source implementation and a verified runtime/test runner.
 
 workflow:
   execution_mode: auto
-  artifact_store: openspec
-  delivery_strategy: ask-on-risk
-  review_budget_changed_lines: 2000
+  artifact_store: hybrid
+  delivery_strategy: auto-chain
+  review_budget_changed_lines: 1000
+  review_budget_authority: explicit maintainer-approved size exception
+  delivery_authorization: no archive, commit, push, or PR authorized
   chain_strategy: deferred
 
 implementation_status:
   phase0: complete
   phase1:
-    implemented: "P1.1–P1.5"
-    pending: "P1.6"
+    implemented: "P1.1–P1.6"
+    pending: "no implementation task unchecked; see canonical verify-report for verification disposition"
   verified_runner:
     command: "go test ./..."
-    result: "passed on go1.27.0 darwin/arm64"
+    result: "historical PASS on go1.27.0 darwin/arm64; not rerun during this refresh"
     selected_sqlite_module: "modernc.org/sqlite v1.58.0"
 
 rules:
@@ -37,15 +39,35 @@ rules:
     - Record crash windows, idempotency, bounded contention, and SQLite/Markdown authority boundaries.
   tasks:
     - Plan behavioral work in strict TDD order and include verification evidence.
-    - Keep implementation tasks reviewable within the 2000 changed-line budget; ask when risk requires a delivery decision.
+    - Keep each PR within the explicitly approved 1000 changed-line budget; auto-chain when needed, obtaining a chain strategy before creating a chain.
   apply:
     - Require explicit user approval before implementation.
     - Use strict RED -> GREEN -> TRIANGULATE -> REFACTOR for every behavioral change.
     - Do not install dependencies, publish, commit, or run paid/live integrations without applicable approval.
 
+  verify:
+    - Preserve all historical failed verification reports and the original P1.1 TESTONLY metric-isolation RED deficiency.
+    - The user explicitly accepts that original P1.1 historical deficiency for closure only; do not treat it as a remaining blocker once fresh production-path GREEN and independent verification satisfy the remaining requirements.
+    - Never fabricate or relabel historical RED; the closure exception does not claim strict-TDD compliance for that original cycle.
+    - Strict RED -> GREEN -> TRIANGULATE -> REFACTOR remains mandatory for every new behavioral change and every other work unit.
+    - Fresh independent verification must check the production recorder regression and full workspace suite; configuration refresh alone cannot claim PASS or authorize archive.
+
 strict_tdd: true
 
 testing:
   runner_availability: verified
+  test_command: go test ./...
   proposed_go_command: go test ./...
-  note: The Go runner is verified on go1.27.0 darwin/arm64; use observed Go evidence and keep P1.6 pending until its required verification evidence is recorded.
+  toolchain_observed: go1.27.0 darwin/arm64
+  note: Toolchain presence checked during this static refresh; all test results are historical, not fresh verification.
+  projects:
+    - path: .
+      stack: Go 1.27, modernc SQLite, MCP Go SDK
+      test_command: go test ./...
+      framework: Go testing
+      layers: [unit, integration, CLI process, MCP stdio process]
+      coverage_command: go test ./... -coverprofile=coverage.out
+      linter: no dedicated linter configured
+      static_analysis_command: go vet ./...
+      type_check_command: go test ./...
+      formatter_command: gofmt

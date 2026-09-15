@@ -720,10 +720,19 @@ func TestDocumentAdaptersHaveEquivalentSemanticEnvelopes(t *testing.T) {
 	}
 	projectListCLI, projectListMCP := compare("project-general default list", "document.list", "parity-project-default", project, map[string]any{}, nil)
 	for _, response := range []map[string]any{projectListCLI, projectListMCP} {
-		for _, item := range response["result"].(map[string]any)["documents"].([]any) {
+		documents := response["result"].(map[string]any)["documents"].([]any)
+		if len(documents) != 2 {
+			t.Fatalf("project-general list = %#v, want exactly two project documents", response)
+		}
+		documentIDs := make(map[string]int)
+		for _, item := range documents {
+			documentIDs[item.(map[string]any)["document_id"].(string)]++
 			if _, found := item.(map[string]any)["workstream_id"]; found {
 				t.Fatalf("project-general list widened into a workstream: %#v", response)
 			}
+		}
+		if documentIDs["project-doc"] != 1 || documentIDs["foreign-doc"] != 1 {
+			t.Fatalf("project-general list = %#v, want project-doc and foreign-doc exactly once", response)
 		}
 	}
 	workstreamListCLI, workstreamListMCP := compare("workstream default list", "document.list", "parity-workstream-default", workstream, map[string]any{}, nil)

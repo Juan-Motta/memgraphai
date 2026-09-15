@@ -268,5 +268,5 @@ func continuityError(err error) error {
 	if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
 		return ContinuityError{Code: continuityConflict}
 	}
-	return err
+	return mapRecoveryError(err)
 }
