@@ -1031,3 +1031,25 @@ func TestCommandTransportReapsUnresponsiveChild(t *testing.T) {
 		t.Fatal("child has no process state after bounded close; want reaped")
 	}
 }
+
+func responseOperationIDs(value any) []string {
+	var IDs []string
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			if operationID, ok := typed["operation_id"].(string); ok {
+				IDs = append(IDs, operationID)
+			}
+			for _, child := range typed {
+				visit(child)
+			}
+		case []any:
+			for _, child := range typed {
+				visit(child)
+			}
+		}
+	}
+	visit(value)
+	return IDs
+}

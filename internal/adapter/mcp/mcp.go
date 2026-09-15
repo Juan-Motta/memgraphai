@@ -2,6 +2,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"memgraphai/internal/app"
@@ -55,10 +57,7 @@ func newServer(projects app.ProjectService, continuity app.ContinuityService, do
 }
 
 func addTool(server *gomcp.Server, operation string, handler app.Handler, executor app.Service, wire *wireMetricWriter) {
-	gomcp.AddTool(server, &gomcp.Tool{Name: operation, Description: "MemGraph AI " + operation}, func(ctx context.Context, _ *gomcp.CallToolRequest, input ToolInput) (*gomcp.CallToolResult, map[string]any, error) {
-		if wire != nil {
-			wire.waitForPending(ctx)
-		}
+	gomcp.AddTool(server, &gomcp.Tool{Name: operation, Description: "MemGraph AI " + operation}, func(ctx context.Context, request *gomcp.CallToolRequest, input ToolInput) (*gomcp.CallToolResult, map[string]any, error) {
 		businessInput, _ := json.Marshal(input.Input)
 		raw, _ := json.Marshal(app.Request{ContractVersion: input.ContractVersion, OperationID: input.OperationID, Operation: operation, Scope: input.Scope, Input: businessInput, Page: input.Page})
 		started := time.Now()
@@ -67,16 +66,25 @@ func addTool(server *gomcp.Server, operation string, handler app.Handler, execut
 			recordedExecutor.Recorder = nil
 		}
 		var result app.Result
+		// Serialize business work with metric persistence, never with a pending response.
+		// This avoids SQLite read-to-write upgrade contention from our own recorder.
+		if wire != nil {
+			wire.mu.Lock()
+		}
 		serialized, response := recordedExecutor.ExecuteJSON(ctx, raw, "mcp", func(ctx context.Context, request app.Request) app.Result {
 			result = handler(ctx, request)
 			return result
 		})
 		if wire != nil {
-			wire.offer(telemetry.Operation{OperationID: input.OperationID, RecordedAt: time.Now(), Interface: "mcp", ScopeKind: input.Scope.Kind, ProjectID: input.Scope.ProjectID, WorkstreamID: input.Scope.WorkstreamID, SessionID: input.Scope.SessionID, Outcome: response.Outcome.Code, BackendDuration: time.Since(started), ResultCount: result.ResultCount})
+			wire.mu.Unlock()
 		}
+
 		var output map[string]any
 		if err := json.Unmarshal(serialized, &output); err != nil {
 			output = map[string]any{"outcome": map[string]string{"code": app.Internal}}
+		}
+		if wire != nil && response.OperationID != nil && request.Params != nil {
+			wire.offer(ctx, requestIDFromMeta(request.Params.Meta), telemetry.Operation{OperationID: input.OperationID, RecordedAt: time.Now(), Interface: "mcp", ScopeKind: input.Scope.Kind, ProjectID: input.Scope.ProjectID, WorkstreamID: input.Scope.WorkstreamID, SessionID: input.Scope.SessionID, Outcome: response.Outcome.Code, BackendDuration: time.Since(started), ResultCount: result.ResultCount})
 		}
 		return nil, output, nil
 	})
@@ -89,55 +97,52 @@ func RunStdio(ctx context.Context, projects app.ProjectService, continuity app.C
 
 // RunIO permits tests and the executable to use the SDK's newline-delimited stdio framing.
 func RunIO(ctx context.Context, projects app.ProjectService, continuity app.ContinuityService, documents app.DocumentService, executor app.Service, reader io.ReadCloser, writer io.WriteCloser, checkpoints ...app.CheckpointService) error {
-	wire := &wireMetricWriter{WriteCloser: writer, recorder: executor.Recorder, pending: make(map[string]pendingMetric)}
-	return newServer(projects, continuity, documents, executor, wire, checkpoints...).Run(ctx, &gomcp.IOTransport{Reader: reader, Writer: wire})
+	wire := &wireMetricWriter{WriteCloser: writer, recorder: executor.Recorder, pending: make(map[string]telemetry.Operation)}
+	return newServer(projects, continuity, documents, executor, wire, checkpoints...).Run(ctx, &gomcp.IOTransport{Reader: newRequestIDReader(reader), Writer: wire})
 }
 
 type wireMetricWriter struct {
 	io.WriteCloser
 	recorder telemetry.Recorder
 	mu       sync.Mutex
-	pending  map[string]pendingMetric
+	pending  map[string]telemetry.Operation
 	frame    []byte
 }
 
-type pendingMetric struct {
-	operation telemetry.Operation
-	done      chan struct{}
-}
-
-func (w *wireMetricWriter) offer(operation telemetry.Operation) {
-	if w.recorder == nil || operation.OperationID == "" {
+// Offers are keyed by the connection's JSON-RPC request ID, never by the
+// caller's reusable application operation ID or potentially identical payload.
+func (w *wireMetricWriter) offer(ctx context.Context, requestID string, operation telemetry.Operation) {
+	if w.recorder == nil || requestID == "" || operation.OperationID == "" || ctx.Err() != nil {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.pending[operation.OperationID] = pendingMetric{operation: operation, done: make(chan struct{})}
+	if w.pending == nil || ctx.Err() != nil {
+		return
+	}
+	// A completed request can still have a response buffered in a legacy SDK
+	// batch. Retain its metric until the actual frame or connection close.
+	w.pending[requestID] = operation
 }
 
-func (w *wireMetricWriter) waitForPending(ctx context.Context) {
+// Closing the underlying writer first unblocks any Write holding the mutex.
+// Offers whose frames cannot be emitted are released without invented metrics.
+func (w *wireMetricWriter) Close() error {
+	err := w.WriteCloser.Close()
 	w.mu.Lock()
-	pending := make([]chan struct{}, 0, len(w.pending))
-	for _, metric := range w.pending {
-		pending = append(pending, metric.done)
-	}
+	w.pending = nil
+	w.frame = nil
 	w.mu.Unlock()
-	for _, done := range pending {
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return
-		}
-	}
+	return err
 }
 
 func (w *wireMetricWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	n, err := w.WriteCloser.Write(data)
 	if n == 0 {
 		return n, err
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.frame = append(w.frame, data[:n]...)
 	for {
 		end := 0
@@ -154,40 +159,44 @@ func (w *wireMetricWriter) Write(data []byte) (int, error) {
 }
 
 func (w *wireMetricWriter) recordFrame(frame []byte) {
-	var response any
-	if json.Unmarshal(frame, &response) != nil {
+	if bytes.HasPrefix(bytes.TrimSpace(frame), []byte{'['}) {
+		var batch []json.RawMessage
+		if json.Unmarshal(frame, &batch) != nil {
+			return
+		}
+		for _, response := range batch {
+			w.recordResponse(response, len(frame))
+		}
 		return
 	}
-	for _, operationID := range responseOperationIDs(response) {
-		metric, found := w.pending[operationID]
-		if !found {
-			continue
-		}
-		delete(w.pending, operationID)
-		metric.operation.ResponseBytes = len(frame)
-		_ = w.recorder.Record(context.Background(), metric.operation)
-		close(metric.done)
-	}
+	w.recordResponse(frame, len(frame))
 }
 
-func responseOperationIDs(value any) []string {
-	var IDs []string
-	var visit func(any)
-	visit = func(current any) {
-		switch typed := current.(type) {
-		case map[string]any:
-			if operationID, ok := typed["operation_id"].(string); ok {
-				IDs = append(IDs, operationID)
-			}
-			for _, child := range typed {
-				visit(child)
-			}
-		case []any:
-			for _, child := range typed {
-				visit(child)
-			}
-		}
+func (w *wireMetricWriter) recordResponse(raw []byte, frameBytes int) {
+	message, err := jsonrpc.DecodeMessage(raw)
+	if err != nil {
+		return
 	}
-	visit(value)
-	return IDs
+	response, ok := message.(*jsonrpc.Response)
+	if !ok {
+		return
+	}
+	key := requestIDKey(response.ID)
+	metric, found := w.pending[key]
+	if !found {
+		return
+	}
+	delete(w.pending, key)
+	metric.ResponseBytes = frameBytes
+	_ = w.recorder.Record(context.Background(), metric)
+}
+
+func requestIDKey(id jsonrpc.ID) string {
+	encoded, _ := json.Marshal(id.Raw())
+	return string(encoded)
+}
+
+func requestIDFromMeta(meta gomcp.Meta) string {
+	id, _ := meta[requestIDMeta].(string)
+	return id
 }

@@ -320,6 +320,8 @@ Detailed worker behavior remains to be designed, including bounded retries, cros
 
 ### 11.1 Operation telemetry
 
+MCP response sizes count the complete emitted JSON-RPC frame, including its newline. Metric correlation uses the connection's JSON-RPC request ID, carried only in process, rather than the caller-supplied operation ID or response contents. Missing or canceled response metrics never hold a pending-response gate over subsequent calls.
+
 **Confirmed:** Phase 1 records operation ID, timestamp, interface, declared project/workstream/session scope, status, total backend duration, serialized response bytes, and result counts where available. Counter-metric failure remains independent of operation success.
 
 Detailed analytics adds requested and executed search mode, safe categorical filters, model/index revision, stage durations, document/section counts, character and UTF-8 byte counts, approximate tokens, and approximation method or tokenizer/model version where applicable. Character measurement needs an exact design definition. Approximate tokens are not actual agent context usage or billing.
